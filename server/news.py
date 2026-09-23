@@ -57,10 +57,10 @@ PRICES = {"mistral-small-2603": (0.15, 0.6), "ministral-14b-2512": (0.2, 0.2), "
 DAILY_BUDGET = 0.60
 # With CLAUDE_CODE_OAUTH_TOKEN set, Claude writes the stories through Claude Code on the user's subscription, and
 # Mistral takes over when Claude is unavailable. The cap is in API-equivalent dollars as Claude Code reports them;
-# it keeps the app to a share of the subscription's weekly limit.
+# it only guards the subscription against a runaway loop.
 CLAUDE_WRITER = "claude-sonnet-5"
 CLAUDE_EFFORT = "low"
-CLAUDE_DAILY_BUDGET = 5.00
+CLAUDE_DAILY_BUDGET = 20.00
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS articles(
