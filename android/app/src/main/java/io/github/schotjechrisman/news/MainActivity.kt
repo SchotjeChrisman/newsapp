@@ -41,7 +41,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         state.openReport = intent.getBooleanExtra(MorningReport.OPEN, false)
-        MorningReport.schedule(this)
+        MorningReport.ensure(this)
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             askToNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -137,8 +137,12 @@ fun App(state: NewsState) {
         screen = if (screen == Screen.Story) storyFrom else Screen.Stories
     }
     LaunchedEffect(state.openReport) {
-        if (state.openReport && state.server.isNotBlank()) screen = Screen.Report
+        if (!state.openReport) return@LaunchedEffect
         state.openReport = false
+        if (state.server.isNotBlank()) {
+            screen = Screen.Report
+            state.refresh()  // the last download may be from before the report was built
+        }
     }
 
     when (screen) {
