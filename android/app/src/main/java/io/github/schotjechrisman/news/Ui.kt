@@ -37,6 +37,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -47,6 +48,8 @@ import androidx.compose.material3.SuggestionChip
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
@@ -55,6 +58,7 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -63,9 +67,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
@@ -151,6 +158,7 @@ fun StoriesScreen(
     onRefresh: () -> Unit,
     onOpen: (Story) -> Unit,
     onReport: () -> Unit,
+    onSearch: () -> Unit,
     onFeeds: () -> Unit,
     onServer: () -> Unit,
 ) {
@@ -160,6 +168,7 @@ fun StoriesScreen(
             TopAppBar(
                 title = { Text("News") },
                 actions = {
+                    IconButton(onClick = onSearch) { Icon(painterResource(R.drawable.ic_search), "Search") }
                     IconButton(onClick = { menu = true }) { Icon(painterResource(R.drawable.ic_more), "More") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         DropdownMenuItem(text = { Text("Feed status") }, onClick = { menu = false; onFeeds() })
@@ -201,6 +210,66 @@ fun StoriesScreen(
                             modifier = Modifier.padding(16.dp),
                         )
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SearchScreen(
+    query: String,
+    onQuery: (String) -> Unit,
+    onSearch: () -> Unit,
+    results: List<Story>?,
+    searching: Boolean,
+    error: String?,
+    onOpen: (Story) -> Unit,
+    onBack: () -> Unit,
+) {
+    val focus = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(Unit) { if (results == null) focus.requestFocus() }
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                navigationIcon = { BackButton(onBack) },
+                title = {
+                    val clear = Color.Transparent
+                    TextField(
+                        value = query,
+                        onValueChange = onQuery,
+                        placeholder = { Text("Search all stories") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(onSearch = { keyboard?.hide(); onSearch() }),
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = clear, unfocusedContainerColor = clear,
+                            focusedIndicatorColor = clear, unfocusedIndicatorColor = clear,
+                        ),
+                        modifier = Modifier.fillMaxWidth().focusRequester(focus),
+                    )
+                },
+            )
+        },
+    ) { padding ->
+        LazyColumn(contentPadding = PaddingValues(top = padding.calculateTopPadding(), bottom = padding.calculateBottomPadding() + 16.dp)) {
+            if (searching) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+            if (error != null) item { Banner(error) }
+            if (results.isNullOrEmpty()) {
+                item {
+                    Text(
+                        if (results == null) "Searches every story since the server started: headlines, summaries, updates and " +
+                            "article titles, Dutch ones too." else if (searching) "" else "No stories found.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+            } else {
+                items(results, key = { it.id }) { story ->
+                    StoryRow(story) { onOpen(story) }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 }
             }
         }

@@ -81,39 +81,44 @@ fun parse(json: String): News {
     return News(
         built = time(root.getString("built")),
         tabs = root.getJSONArray("tabs").strings(),
-        stories = root.getJSONArray("stories").objects().map { s ->
-            val lean = s.getJSONObject("lean")
-            Story(
-                id = s.getLong("id"),
-                headline = s.getString("headline"),
-                summary = s.text("summary"),
-                tabs = s.getJSONArray("tabs").strings(),
-                sources = s.getInt("sources"),
-                updated = time(s.getString("updated")),
-                lean = Lean(lean.getInt("left"), lean.getInt("center"), lean.getInt("right")),
-                summaryFrom = refs(s.getJSONArray("summary_from")),
-                updates = s.getJSONArray("updates").objects().map {
-                    Update(time(it.getString("at")), it.getString("text"), refs(it.getJSONArray("from")))
-                },
-                quotes = s.getJSONArray("quotes").objects().map {
-                    Quote(it.getString("text"), it.getString("outlet"), it.getString("url"), it.getBoolean("translated"))
-                },
-                articles = s.getJSONArray("articles").objects().map {
-                    Article(
-                        outlet = it.getString("outlet"),
-                        title = it.getString("title"),
-                        url = it.getString("url"),
-                        published = time(it.getString("published")),
-                        opinion = it.getBoolean("opinion"),
-                        lean = it.text("lean"),
-                    )
-                },
-            )
-        },
+        stories = root.getJSONArray("stories").objects().map(::story),
         feeds = root.getJSONArray("feeds").objects().map {
             Feed(it.getString("name"), it.getString("url"), it.optInt("items"), it.text("error"))
         },
         report = root.optJSONObject("report")?.let(::report),
+    )
+}
+
+/** The stories /api/search found. */
+fun parseSearch(json: String): List<Story> = JSONObject(json).getJSONArray("stories").objects().map(::story)
+
+private fun story(s: JSONObject): Story {
+    val lean = s.getJSONObject("lean")
+    return Story(
+        id = s.getLong("id"),
+        headline = s.getString("headline"),
+        summary = s.text("summary"),
+        tabs = s.getJSONArray("tabs").strings(),
+        sources = s.getInt("sources"),
+        updated = time(s.getString("updated")),
+        lean = Lean(lean.getInt("left"), lean.getInt("center"), lean.getInt("right")),
+        summaryFrom = refs(s.getJSONArray("summary_from")),
+        updates = s.getJSONArray("updates").objects().map {
+            Update(time(it.getString("at")), it.getString("text"), refs(it.getJSONArray("from")))
+        },
+        quotes = s.getJSONArray("quotes").objects().map {
+            Quote(it.getString("text"), it.getString("outlet"), it.getString("url"), it.getBoolean("translated"))
+        },
+        articles = s.getJSONArray("articles").objects().map {
+            Article(
+                outlet = it.getString("outlet"),
+                title = it.getString("title"),
+                url = it.getString("url"),
+                published = time(it.getString("published")),
+                opinion = it.getBoolean("opinion"),
+                lean = it.text("lean"),
+            )
+        },
     )
 }
 

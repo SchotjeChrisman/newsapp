@@ -25,6 +25,7 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.lifecycleScope
 import java.io.File
 import java.net.ConnectException
+import java.net.URLEncoder
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import kotlin.coroutines.cancellation.CancellationException
@@ -73,6 +74,13 @@ class NewsState(context: Context) {
         private set
     var error by mutableStateOf<String?>(null)
         private set
+    /** Search results; null before the first search. */
+    var results by mutableStateOf<List<Story>?>(null)
+        private set
+    var searching by mutableStateOf(false)
+        private set
+    var searchError by mutableStateOf<String?>(null)
+        private set
     /** Set when the morning report's notification opens the app. */
     var openReport by mutableStateOf(false)
 
@@ -104,23 +112,42 @@ class NewsState(context: Context) {
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            if (server == from) {
-                error = when (e) {
-                    is UnknownHostException -> "Can't find $from. Is Tailscale on?"
-                    is ConnectException, is SocketTimeoutException -> "Can't reach $from."
-                    is JSONException -> "The server sent something the app can't read."
-                    else -> "Couldn't load the news: ${e.message ?: e.javaClass.simpleName}"
-                }
-            }
+            if (server == from) error = explain(e, from)
         } finally {
             loading = false
         }
         // The address changed while this was loading: fetch from the new one.
         if (server != from) refresh()
     }
+
+    /** Searches every story on the server, not only the ones the app holds. */
+    suspend fun search(query: String) {
+        if (query.isBlank() || server.isBlank()) return
+        val from = server
+        searching = true
+        searchError = null
+        try {
+            results = withContext(Dispatchers.IO) {
+                parseSearch(download(from, "/api/search?q=" + URLEncoder.encode(query.trim(), "UTF-8"), timeout = 20_000))
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            searchError = explain(e, from)
+        } finally {
+            searching = false
+        }
+    }
+
+    private fun explain(e: Exception, server: String) = when (e) {
+        is UnknownHostException -> "Can't find $server. Is Tailscale on?"
+        is ConnectException, is SocketTimeoutException -> "Can't reach $server."
+        is JSONException -> "The server sent something the app can't read."
+        else -> "Couldn't load the news: ${e.message ?: e.javaClass.simpleName}"
+    }
 }
 
-enum class Screen { Stories, Story, Report, Feeds, Server }
+enum class Screen { Stories, Story, Report, Search, Feeds, Server }
 
 @Composable
 fun App(state: NewsState) {
@@ -129,6 +156,7 @@ fun App(state: NewsState) {
     var storyId by rememberSaveable { mutableLongStateOf(0L) }
     var storyFrom by rememberSaveable { mutableStateOf(Screen.Stories) }
     var tab by rememberSaveable { mutableStateOf("All") }
+    var query by rememberSaveable { mutableStateOf("") }
     // One scroll position per tab, kept while a story is open.
     val lists = remember { mutableMapOf<String, LazyListState>() }
     val news = state.news
@@ -158,17 +186,28 @@ fun App(state: NewsState) {
             onRefresh = { scope.launch { state.refresh() } },
             onOpen = { storyId = it.id; storyFrom = Screen.Stories; screen = Screen.Story },
             onReport = { screen = Screen.Report },
+            onSearch = { screen = Screen.Search },
             onFeeds = { screen = Screen.Feeds },
             onServer = { screen = Screen.Server },
         )
         Screen.Story -> {
-            val story = news?.stories?.find { it.id == storyId }
+            val story = news?.stories?.find { it.id == storyId } ?: state.results?.find { it.id == storyId }
             if (story == null) LaunchedEffect(Unit) { screen = storyFrom }
             else StoryScreen(story, onBack = { screen = storyFrom })
         }
         Screen.Report -> ReportScreen(
             report = news?.report,
             onOpen = { storyId = it; storyFrom = Screen.Report; screen = Screen.Story },
+            onBack = { screen = Screen.Stories },
+        )
+        Screen.Search -> SearchScreen(
+            query = query,
+            onQuery = { query = it },
+            onSearch = { scope.launch { state.search(query) } },
+            results = state.results,
+            searching = state.searching,
+            error = state.searchError,
+            onOpen = { storyId = it.id; storyFrom = Screen.Search; screen = Screen.Story },
             onBack = { screen = Screen.Stories },
         )
         Screen.Feeds -> FeedsScreen(news?.feeds.orEmpty(), onBack = { screen = Screen.Stories })
