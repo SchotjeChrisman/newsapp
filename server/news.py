@@ -355,6 +355,7 @@ def render(db):
   --ground: #0e1217; --surface: #151a21; --ink: #e4e8ee; --muted: #97a1ae; --rule: #28303a;
   --accent: #7eaaff; --accent-soft: #1a2940; --warn: #e3a857; --warn-soft: #33260f; --bad: #ff7b6e;
 }}
+[hidden] {{ display: none !important; }}
 body {{ background: var(--ground); color: var(--ink); font: 15px/1.5 var(--sans); padding: 0 16px; }}
 main {{ max-width: 46rem; margin: 0 auto; padding-block: 28px 64px; }}
 header h1 {{ font: 600 1.9rem/1.15 var(--serif); margin: 0 0 6px; text-wrap: balance; }}
