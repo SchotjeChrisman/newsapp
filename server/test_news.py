@@ -298,6 +298,63 @@ def test_write():
     del os.environ["MISTRAL_API_KEY"]
 
 
+def test_claude_writer():
+    class Run:
+        def __init__(self, stdout, returncode=0):
+            self.stdout, self.stderr, self.returncode = stdout, "", returncode
+
+    real_run = news.subprocess.run
+    calls = []
+    news.subprocess.run = lambda cmd, **kw: calls.append(cmd) or Run(json.dumps(
+        {"is_error": False, "result": "done", "structured_output": {"ok": 1}, "total_cost_usd": 0.01}))
+    assert news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {}) == ('{"ok": 1}', 0.01)
+    assert json.loads(calls[0][calls[0].index("--json-schema") + 1]) == news.SCHEMAS[news.NEW_PROMPT]
+    assert calls[0][calls[0].index("--tools") + 1] == "", "Claude Code's own tools are off"
+    for run in (Run(json.dumps({"is_error": True, "result": "Claude AI usage limit reached"}), 1), Run("not json")):
+        news.subprocess.run = lambda cmd, **kw: run
+        try:
+            news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {})
+            raise AssertionError("expected ClaudeUnavailable")
+        except news.ClaudeUnavailable:
+            pass
+    news.subprocess.run = real_run
+
+    os.environ["MISTRAL_API_KEY"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "test"
+    db = news.connect()
+    db.execute("INSERT INTO stories(id, updated, n) VALUES (1, ?, 1), (2, ?, 1)", (news.iso(news.now()),) * 2)
+    add_article(db, 1, 1, "NOS", "Kabinet valt")
+    add_article(db, 2, 2, "BBC", "Storm hits coast")
+    used = []
+
+    def reply(system, payload):
+        return json.dumps({"stories": [{"key": st["key"], "headline": "H", "summary": "S", "region": "NL"}
+                                       for st in payload["stories"]]})
+
+    def claude(model, system, payload):
+        used.append(model)
+        if len(used) > 1:
+            raise news.ClaudeUnavailable("Claude AI usage limit reached")
+        return reply(system, payload), 0.25
+
+    def mistral(model, system, payload, max_tokens):
+        used.append(model)
+        return reply(system, payload), (100, 10)
+
+    news.call_claude, news.call_mistral = claude, mistral
+    news.batches = lambda stories, max_stories, max_articles: ([st] for st in stories)  # one story per request
+    news.write(db)
+    assert used == [news.CLAUDE_WRITER, news.CLAUDE_WRITER, news.WRITER], "Claude first, Mistral once Claude is out"
+    assert db.execute("SELECT COUNT(*) FROM stories WHERE headline = 'H'").fetchone()[0] == 2
+    assert db.execute("SELECT claude_usd FROM spend").fetchone()[0] == 0.25
+
+    db.execute("UPDATE stories SET headline = NULL")
+    db.execute("UPDATE spend SET claude_usd = ?", (news.CLAUDE_DAILY_BUDGET,))
+    used.clear()
+    news.write(db)
+    assert used == [news.WRITER, news.WRITER], "past the Claude budget, Mistral writes"
+    del os.environ["MISTRAL_API_KEY"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+
+
 test_parse()
 test_outlet_key()
 test_sources()
@@ -309,4 +366,5 @@ test_translate_before_grouping()
 test_language_backfill()
 test_mistral_articles()
 test_write()
+test_claude_writer()
 print("ok")

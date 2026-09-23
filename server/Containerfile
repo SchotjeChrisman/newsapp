@@ -1,6 +1,14 @@
 FROM docker.io/library/python:3.13-slim
+# Claude Code from Anthropic's signed apt repository (stable channel); package installs don't auto-update.
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+ && install -d -m 0755 /etc/apt/keyrings \
+ && curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o /etc/apt/keyrings/claude-code.asc \
+ && echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main" \
+    > /etc/apt/sources.list.d/claude-code.list \
+ && apt-get update && apt-get install -y --no-install-recommends claude-code \
+ && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir fastembed==0.8.1
-ENV NEWS_MODELS=/models TZ=Europe/Amsterdam
+ENV NEWS_MODELS=/models TZ=Europe/Amsterdam CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 RUN python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2', cache_dir='/models')"
 WORKDIR /app
 COPY news.py sources.toml ./

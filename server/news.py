@@ -10,6 +10,7 @@ import os
 import re
 import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -54,6 +55,12 @@ TRANSLATOR = "ministral-8b-2512"
 PRICES = {"mistral-small-2603": (0.15, 0.6), "ministral-14b-2512": (0.2, 0.2), "ministral-8b-2512": (0.15, 0.15)}
 # The account has a monthly limit too; this keeps one busy day from eating the month.
 DAILY_BUDGET = 0.60
+# With CLAUDE_CODE_OAUTH_TOKEN set, Claude writes the stories through Claude Code on the user's subscription, and
+# Mistral takes over when Claude is unavailable. The cap is in API-equivalent dollars as Claude Code reports them;
+# it keeps the app to a share of the subscription's weekly limit.
+CLAUDE_WRITER = "claude-sonnet-5"
+CLAUDE_EFFORT = "low"
+CLAUDE_DAILY_BUDGET = 5.00
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS articles(
@@ -65,11 +72,12 @@ CREATE TABLE IF NOT EXISTS stories(id INTEGER PRIMARY KEY, updated TEXT, n INTEG
 CREATE TABLE IF NOT EXISTS sources(url TEXT PRIMARY KEY, name TEXT, checked TEXT, items INTEGER, error TEXT);
 CREATE TABLE IF NOT EXISTS updates(id INTEGER PRIMARY KEY, story INTEGER, at TEXT, text TEXT, articles TEXT);
 CREATE TABLE IF NOT EXISTS quotes(id INTEGER PRIMARY KEY, story INTEGER, article INTEGER, quote TEXT, quote_en TEXT);
-CREATE TABLE IF NOT EXISTS spend(day TEXT PRIMARY KEY, usd REAL);
+CREATE TABLE IF NOT EXISTS spend(day TEXT PRIMARY KEY, usd REAL DEFAULT 0);
 """
 # Columns added after the first release; connect() adds them to older databases.
 COLUMNS = {"articles": ["lang TEXT", "title_en TEXT", "summary_en TEXT", "written INTEGER DEFAULT 0"],
-           "stories": ["headline TEXT", "summary TEXT", "region TEXT", "summary_articles TEXT"]}
+           "stories": ["headline TEXT", "summary TEXT", "region TEXT", "summary_articles TEXT"],
+           "spend": ["claude_usd REAL DEFAULT 0"]}
 
 
 def now():
@@ -329,15 +337,47 @@ def call_mistral(model, system, payload, max_tokens):
     return content, (reply["usage"]["prompt_tokens"], reply["usage"]["completion_tokens"])
 
 
+class ClaudeUnavailable(Exception):
+    pass
+
+
+def call_claude(model, system, payload):
+    """One request through Claude Code in print mode: our system prompt instead of Claude Code's, no tools, one turn.
+    Returns the reply text and Claude Code's API-equivalent cost estimate."""
+    # --tools "" removes Claude Code's own tools; the JSON schema is answered through its structured-output tool,
+    # which takes a second turn (a third if the first answer doesn't validate).
+    cmd = ["claude", "-p", "--model", model, "--effort", CLAUDE_EFFORT, "--system-prompt", system,
+           "--output-format", "json", "--json-schema", json.dumps(SCHEMAS[system]), "--tools", "",
+           "--max-turns", "3", "--no-session-persistence", "--disable-slash-commands", "--strict-mcp-config"]
+    try:
+        run = subprocess.run(cmd, input=json.dumps(payload, ensure_ascii=False), capture_output=True, text=True,
+                             timeout=600)
+        reply = json.loads(run.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        raise ClaudeUnavailable(f"{type(e).__name__}: {e}") from e
+    if not isinstance(reply, dict) or reply.get("is_error") or run.returncode:
+        detail = reply.get("result") if isinstance(reply, dict) else None
+        raise ClaudeUnavailable(str(detail or run.stderr.strip() or f"exit {run.returncode}")[:300])
+    return json.dumps(reply.get("structured_output")), float(reply.get("total_cost_usd") or 0)
+
+
 def ask(db, model, system, payload, max_tokens):
-    """call_mistral within the daily budget; the cost is recorded before the reply is parsed."""
+    """One JSON request within the day's budget; the cost is recorded before the reply is parsed."""
     day = now().date().isoformat()
-    spent = db.execute("SELECT usd FROM spend WHERE day = ?", (day,)).fetchone()
-    if spent and spent[0] >= DAILY_BUDGET:
-        raise OverBudget(f"daily Mistral budget of ${DAILY_BUDGET:.2f} reached")
-    content, (tokens_in, tokens_out) = call_mistral(model, system, payload, max_tokens)
-    usd = (tokens_in * PRICES[model][0] + tokens_out * PRICES[model][1]) / 1e6
-    db.execute("INSERT INTO spend VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET usd = usd + excluded.usd", (day, usd))
+    db.execute("INSERT OR IGNORE INTO spend(day) VALUES (?)", (day,))
+    usd, claude_usd = db.execute("SELECT COALESCE(usd, 0), COALESCE(claude_usd, 0) FROM spend WHERE day = ?",
+                                 (day,)).fetchone()
+    if model.startswith("claude"):
+        if claude_usd >= CLAUDE_DAILY_BUDGET:
+            raise ClaudeUnavailable(f"daily Claude budget of ${CLAUDE_DAILY_BUDGET:.2f} (API-equivalent) reached")
+        content, cost = call_claude(model, system, payload)
+        db.execute("UPDATE spend SET claude_usd = COALESCE(claude_usd, 0) + ? WHERE day = ?", (cost, day))
+    else:
+        if usd >= DAILY_BUDGET:
+            raise OverBudget(f"daily Mistral budget of ${DAILY_BUDGET:.2f} reached")
+        content, (tokens_in, tokens_out) = call_mistral(model, system, payload, max_tokens)
+        cost = (tokens_in * PRICES[model][0] + tokens_out * PRICES[model][1]) / 1e6
+        db.execute("UPDATE spend SET usd = COALESCE(usd, 0) + ? WHERE day = ?", (cost, day))
     db.commit()
     return json.loads(content)
 
@@ -412,6 +452,21 @@ add nothing new; most stories need one or two sentences, some none.
 Return JSON: {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "..."}],
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}"""
 
+QUOTES_SCHEMA = {"type": "array", "items": {"type": "object", "required": ["article", "quote", "quote_en"],
+                                             "properties": {"article": {"type": "string"}, "quote": {"type": "string"},
+                                                            "quote_en": {"type": "string"}}}}
+SCHEMAS = {
+    NEW_PROMPT: {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
+        "type": "object", "required": ["key", "headline", "summary", "region"],
+        "properties": {"key": {"type": "string"}, "headline": {"type": "string"}, "summary": {"type": "string"},
+                       "region": {"enum": REGIONS + ["None"]}, "quotes": QUOTES_SCHEMA}}}}},
+    UPDATE_PROMPT: {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
+        "type": "object", "required": ["key", "facts"],
+        "properties": {"key": {"type": "string"}, "quotes": QUOTES_SCHEMA, "facts": {"type": "array", "items": {
+            "type": "object", "required": ["article", "fact"],
+            "properties": {"article": {"type": "string"}, "fact": {"type": "string"}}}}}}}}},
+}
+
 QUOTE_MARKS = str.maketrans({c: "'" for c in "‘’‚‛"} | {c: '"' for c in "“”„‟«»"})
 
 
@@ -466,8 +521,10 @@ def mistral_articles(rows):
 
 
 def write(db):
-    """Mistral writes new stories and adds updates to written ones. Stories only an opinion column covers wait."""
-    if not os.environ.get("MISTRAL_API_KEY"):
+    """Claude or Mistral writes new stories and adds updates to written ones. Stories only an opinion column covers wait."""
+    writers = ([CLAUDE_WRITER] if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") else []) + (
+        [WRITER] if os.environ.get("MISTRAL_API_KEY") else [])
+    if not writers:
         return
     rows = db.execute("""SELECT a.story, a.id, a.outlet, a.published, a.opinion, a.title, a.summary, a.written,
                                 a.title_en, s.headline, s.summary
@@ -514,7 +571,15 @@ def write(db):
                                              for k, a in articles.items()]}
                                | ({"current": st["current"]} if "current" in st else {}))
             try:
-                result = ask(db, WRITER, prompt, {"stories": stories}, 4000)
+                while True:
+                    try:
+                        result = ask(db, writers[0], prompt, {"stories": stories}, 4000)
+                        break
+                    except ClaudeUnavailable as e:  # a limit or an outage: Mistral writes the rest of this run
+                        print(f"write: Claude unavailable ({e}), switching to Mistral", flush=True)
+                        writers.pop(0)
+                        if not writers:
+                            raise OverBudget("no writer available") from e
                 items = result.get("stories") if isinstance(result, dict) else None
                 for item in items if isinstance(items, list) else []:
                     key = item.get("key") if isinstance(item, dict) else None
@@ -550,8 +615,10 @@ def write(db):
                 print(f"write: batch skipped ({type(e).__name__}: {e})", flush=True)
     except OverBudget as e:
         print(f"write: {e}", flush=True)
-    spent = db.execute("SELECT usd FROM spend WHERE day = ?", (now().date().isoformat(),)).fetchone()
-    print(f"write: {written} new stories, {updated} updates, ${spent[0] if spent else 0:.3f} spent today", flush=True)
+    spent = db.execute("SELECT COALESCE(usd, 0), COALESCE(claude_usd, 0) FROM spend WHERE day = ?",
+                       (now().date().isoformat(),)).fetchone() or (0, 0)
+    print(f"write: {written} new stories, {updated} updates; today Mistral ${spent[0]:.3f},"
+          f" Claude ${spent[1]:.3f} API-equivalent", flush=True)
 
 
 def esc(s):
@@ -665,7 +732,8 @@ def render(db):
     stories.sort(key=lambda s: (s["sources"], s["arts"][-1][5]), reverse=True)
     multi = [s for s in stories if s["sources"] > 1]
     single = [s for s in stories if s["sources"] == 1]
-    spent = db.execute("SELECT usd FROM spend WHERE day = ?", (now().date().isoformat(),)).fetchone()
+    spent = db.execute("SELECT COALESCE(usd, 0), COALESCE(claude_usd, 0) FROM spend WHERE day = ?",
+                       (now().date().isoformat(),)).fetchone() or (0, 0)
     sources = db.execute("SELECT name, url, items, error FROM sources ORDER BY error IS NULL, name").fetchall()
     failing = [s for s in sources if s[3]]
     chips = f'<button type="button" data-filter="All" aria-pressed="true">All <span>{len(multi)}</span></button>'
@@ -752,7 +820,7 @@ tr.bad td a {{ color: var(--bad); }}
   <div class="stats">
     <span><b>{len(rows)}</b> articles</span><span><b>{len(multi)}</b> stories with 2+ sources</span>
     <span><b>{len(single)}</b> single-source stories</span><span>threshold <b>{THRESHOLD:.2f}</b></span>
-    <span>Mistral today <b>${spent[0] if spent else 0:.2f}</b></span>
+    <span>Mistral today <b>${spent[0]:.2f}</b></span><span>Claude today <b>${spent[1]:.2f}</b> API-equivalent</span>
     <span>built <b>{now().astimezone().strftime("%a %d %b %H:%M")}</b></span>
   </div>
 </header>
