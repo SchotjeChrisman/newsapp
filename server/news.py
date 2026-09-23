@@ -4,6 +4,7 @@ has Mistral write them up, and serves a check page."""
 import email.utils
 import fnmatch
 import html
+import http.client
 import json
 import os
 import re
@@ -68,7 +69,7 @@ CREATE TABLE IF NOT EXISTS spend(day TEXT PRIMARY KEY, usd REAL);
 """
 # Columns added after the first release; connect() adds them to older databases.
 COLUMNS = {"articles": ["lang TEXT", "title_en TEXT", "summary_en TEXT", "written INTEGER DEFAULT 0"],
-           "stories": ["headline TEXT", "summary TEXT", "region TEXT"]}
+           "stories": ["headline TEXT", "summary TEXT", "region TEXT", "summary_articles TEXT"]}
 
 
 def now():
@@ -88,9 +89,6 @@ def connect(path=None):
         for column in columns:
             if column.split()[0] not in have:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
-                if column.startswith("lang "):
-                    db.execute("UPDATE articles SET lang = CASE WHEN region IN ('Zwolle', 'Overijssel', 'NL')"
-                               " THEN 'nl' ELSE 'en' END")
     return db
 
 
@@ -351,6 +349,11 @@ Return JSON: {"items": [{"id": <id>, "title": "<English title>", "text": "<Engli
 
 def translate(db):
     """English titles and teasers for Dutch articles, shown on the page and used for grouping."""
+    if db.execute("SELECT 1 FROM articles WHERE lang IS NULL LIMIT 1").fetchone():  # collected before lang existed
+        db.executemany("UPDATE articles SET lang = ? WHERE lang IS NULL AND outlet = ?",
+                       [(src["lang"], src["name"]) for src in load_sources()[0]])
+        db.execute("UPDATE articles SET lang = CASE WHEN region IN ('Zwolle', 'Overijssel', 'NL') THEN 'nl' ELSE 'en' END"
+                   " WHERE lang IS NULL")
     todo = db.execute("SELECT id, title, summary FROM articles WHERE lang = 'nl' AND title_en IS NULL"
                       " AND published >= ?", (iso(now() - OPEN_FOR),)).fetchall()
     for i in range(0, len(todo), 20):
@@ -367,13 +370,17 @@ def translate(db):
 
 RULES = """Rules:
 - Write English only, in plain neutral language: no loaded or emotive words, no speculation.
-- Say only what the articles say. Never add background, significance, reactions or unknowns they don't state
+- Say only what the articles say. Never add background, significance, reactions, numbers or unknowns they don't state
   (no "has drawn attention", "remains unclear", "has not been disclosed").
-- Article texts are often teasers cut off mid-sentence. Never fill in what was cut off: a date, a number or a name
-  the text doesn't give is left out. Use each article's publication time to place words like "Saturday" or "today".
+- Article texts are often teasers cut off mid-sentence, and some articles are only a headline. Never fill in what isn't
+  there: a date, a number or a name the article doesn't give is left out. Use each article's publication time to place
+  words like "Saturday" or "today", but it is when the article appeared, not when the event happened.
+- Dutch articles may come with english_title, a machine translation to help you; the Dutch is what counts.
+  Put Dutch words into English ("Zwolse steeg": an alley in Zwolle), but keep names of people, places and organisations.
 - An article can be a roundup of several topics; write only about the topic the story is about.
-- Each story says how many independent sources it has. With more than one, state facts several of them report
-  plainly and name the outlet for any claim only one reports: "according to Euronews". With one source, don't name it;
+- source_count is the story's number of independent sources. An article several outlets published word for word is
+  given once, with the other outlets in also_in. With more than one source, state facts several sources report plainly
+  and name the outlet for any claim only one source reports: "according to Euronews". With one source, don't name it;
   the app shows it.
 - Mark disputed points as disputed, naming who disputes them.
 - Articles marked opinion are commentary. Never present their claims as facts. If a story has only opinion articles,
@@ -395,10 +402,11 @@ Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "re
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}"""
 
 UPDATE_PROMPT = """You keep a running story in a private news app up to date. You get its current text (headline,
-summary, earlier updates) and new articles. Write an update with what the new articles add: a new number, a reaction,
-a statement, a next step, a correction. 1 to 3 sentences, at most 60 words. Never repeat or rewrite the current text.
-If new reporting contradicts it, say so: "Earlier reports said X; outlets now report Y."
-The update is null only when every fact in the new articles is already in the current text.
+summary, earlier updates) and new articles. If the new articles state something the current text doesn't have yet
+(a new number, a reaction, a statement, a next step, a correction), write an update with exactly that: 1 to 3
+sentences, at most 60 words. Every fact in the update must be in a new article's title or text; an article that is only
+a headline adds at most what its headline says. Never repeat or rewrite the current text. If new reporting contradicts
+it, say so: "Earlier reports said X; outlets now report Y." If the new articles state nothing new, the update is null.
 List the keys of the articles the update is based on.
 """ + RULES + """
 Return JSON: {"stories": [{"key": "s1", "update": "..." or null, "sources": ["a1"],
@@ -435,32 +443,43 @@ def batches(stories, max_stories, max_articles):
         yield batch
 
 
+def mistral_articles(rows):
+    """Articles as Mistral gets them: a word-for-word copy in a sister paper goes in once, its outlet under also_in."""
+    kept = {}
+    for story, aid, outlet, published, opinion, title, summary, written, title_en, *_ in rows:
+        a = kept.setdefault(" ".join(title.casefold().split()), dict(
+            id=aid, outlet=outlet, opinion=bool(opinion), title=title, text=summary[:500],
+            published=datetime.fromisoformat(published).astimezone().strftime("%a %d %b %Y %H:%M"))
+            | ({"english_title": title_en} if title_en else {}))
+        if a["id"] != aid and outlet != a["outlet"] and outlet not in a.get("also_in", []):
+            a.setdefault("also_in", []).append(outlet)
+    return list(kept.values())
+
+
 def write(db):
     """Mistral writes new stories and adds updates to written ones. Stories only an opinion column covers wait."""
     if not os.environ.get("MISTRAL_API_KEY"):
         return
     rows = db.execute("""SELECT a.story, a.id, a.outlet, a.published, a.opinion, a.title, a.summary, a.written,
-                                s.headline, s.summary
+                                a.title_en, s.headline, s.summary
                          FROM articles a JOIN stories s ON s.id = a.story
                          WHERE s.updated >= ? ORDER BY a.published""", (iso(now() - SHOW),)).fetchall()
-    stories = defaultdict(list)
+    by_story = defaultdict(list)
     for r in rows:
-        stories[r[0]].append(r)
+        by_story[r[0]].append(r)
     new, updates = [], []
-    for sid, rs in stories.items():
+    for sid, rs in by_story.items():
         sources = source_count([(r[2], r[5]) for r in rs])
         if sources < 2 and all(r[4] for r in rs):
             continue
-        fresh = [r for r in rs if not r[7]] if rs[0][8] else rs
-        published = lambda p: datetime.fromisoformat(p).astimezone().strftime("%a %d %b %Y %H:%M")
-        articles = [dict(id=r[1], outlet=r[2], published=published(r[3]), opinion=bool(r[4]), title=r[5], text=r[6][:500])
-                    for r in fresh[:30]]
-        if not articles:
+        headline, summary = rs[0][9], rs[0][10]
+        fresh = ([r for r in rs if not r[7]] if headline else rs)[:30]
+        if not fresh:
             continue
-        story = dict(id=sid, sources=sources, articles=articles)
-        if rs[0][8]:
+        story = dict(id=sid, sources=sources, articles=mistral_articles(fresh), ids=[r[1] for r in fresh])
+        if headline:
             earlier = [u[0] for u in db.execute("SELECT text FROM updates WHERE story = ? ORDER BY at", (sid,))]
-            updates.append(story | {"current": dict(headline=rs[0][8], summary=rs[0][9], updates=earlier)})
+            updates.append(story | {"current": dict(headline=headline, summary=summary, updates=earlier)})
         else:
             new.append(story)
     new.sort(key=lambda st: -st["sources"])
@@ -481,36 +500,38 @@ def write(db):
                     n += 1
                     articles[f"a{n}"] = a
                 keyed[f"s{i}"] = (st, articles)
-                stories.append({"key": f"s{i}", "sources": st["sources"],
+                stories.append({"key": f"s{i}", "source_count": st["sources"],
                                 "articles": [{"key": k} | {f: v for f, v in a.items() if f != "id"} for k, a in articles.items()]}
                                | ({"current": st["current"]} if "current" in st else {}))
             try:
                 result = ask(db, WRITER, prompt, {"stories": stories}, 4000)
-            except (ValueError, TypeError, KeyError, OSError) as e:  # bad reply, bad request or network: retry next run
-                print(f"write: batch skipped ({e})", flush=True)
-                continue
-            for item in result.get("stories", []) if isinstance(result, dict) else []:
-                key = item.get("key") if isinstance(item, dict) else None
-                st, articles = keyed.pop(key, (None, None)) if isinstance(key, str) else (None, None)
-                if not st:
-                    continue
-                if prompt is NEW_PROMPT:
-                    headline, summary = str(item.get("headline") or "").strip(), str(item.get("summary") or "").strip()
-                    if not headline or not summary:
+                items = result.get("stories") if isinstance(result, dict) else None
+                for item in items if isinstance(items, list) else []:
+                    key = item.get("key") if isinstance(item, dict) else None
+                    st, articles = keyed.pop(key, (None, None)) if isinstance(key, str) else (None, None)
+                    if not st:
                         continue
-                    region = item.get("region") if item.get("region") in REGIONS else None
-                    db.execute("UPDATE stories SET headline = ?, summary = ?, region = ? WHERE id = ?",
-                               (headline, summary, region, st["id"]))
-                    written += 1
-                elif isinstance(item.get("update"), str) and item["update"].strip():
-                    used = [articles[k]["id"] for k in item.get("sources") or [] if isinstance(k, str) and k in articles]
-                    used = used or [a["id"] for a in articles.values()]
-                    db.execute("INSERT INTO updates(story, at, text, articles) VALUES (?,?,?,?)",
-                               (st["id"], iso(now()), item["update"].strip(), json.dumps(used)))
-                    updated += 1
-                save_quotes(db, st["id"], item.get("quotes"), articles)
-                db.executemany("UPDATE articles SET written = 1 WHERE id = ?", [(a["id"],) for a in articles.values()])
-            db.commit()
+                    if prompt is NEW_PROMPT:
+                        headline, summary = str(item.get("headline") or "").strip(), str(item.get("summary") or "").strip()
+                        if not headline or not summary:
+                            continue
+                        region = item.get("region") if item.get("region") in REGIONS else None
+                        db.execute("UPDATE stories SET headline = ?, summary = ?, region = ?, summary_articles = ? WHERE id = ?",
+                                   (headline, summary, region, json.dumps(st["ids"]), st["id"]))
+                        written += 1
+                    elif isinstance(item.get("update"), str) and item["update"].strip():
+                        cited = item.get("sources") if isinstance(item.get("sources"), list) else []
+                        used = [articles[k]["id"] for k in cited if isinstance(k, str) and k in articles]
+                        db.execute("INSERT INTO updates(story, at, text, articles) VALUES (?,?,?,?)",
+                                   (st["id"], iso(now()), item["update"].strip(),
+                                    json.dumps(used or [a["id"] for a in articles.values()])))
+                        updated += 1
+                    save_quotes(db, st["id"], item.get("quotes"), articles)
+                    db.executemany("UPDATE articles SET written = 1 WHERE id = ?", [(i,) for i in st["ids"]])
+                db.commit()
+            except (ValueError, TypeError, KeyError, AttributeError, IndexError, OSError, http.client.HTTPException) as e:
+                db.rollback()  # a bad reply, a bad request or the network: this batch is tried again next run
+                print(f"write: batch skipped ({type(e).__name__}: {e})", flush=True)
     except OverBudget as e:
         print(f"write: {e}", flush=True)
     spent = db.execute("SELECT usd FROM spend WHERE day = ?", (now().date().isoformat(),)).fetchone()
@@ -557,6 +578,17 @@ def link(url, label, cls=""):
     return f'<a{attr} href="{esc(url)}" target="_blank" rel="noreferrer">{esc(label)}</a>'
 
 
+def sources_line(ids, by_id, most=6):
+    """ "Sources: NOS, AD" for the articles a summary or update was written from, one link per outlet."""
+    first = {}
+    for a in json.loads(ids or "[]"):
+        if a in by_id:
+            first.setdefault(by_id[a][1], by_id[a][4])
+    links = [link(url, outlet) for outlet, url in list(first.items())[:most]]
+    more = f" and {len(first) - most} more" if len(first) > most else ""
+    return f"Sources: {', '.join(links)}{more}" if links else ""
+
+
 def story_html(s):
     arts, sources = s["arts"], s["sources"]
     by_id = {a[8]: a for a in arts}
@@ -565,14 +597,11 @@ def story_html(s):
     if more:
         items += f'<li><details><summary>{len(arts) - 5} more</summary><ul>{more}</ul></details></li>'
     body = f'<h2>{esc(s["headline"] or arts[0][3])}</h2>'
-    if sources == 1:
-        body += f'<p class="from">Only reported by {esc(", ".join(dict.fromkeys(a[1] for a in arts)))}</p>'
     if s["summary"]:
-        body += f'<p class="summary">{esc(s["summary"])}</p>'
+        body += f'<p class="summary">{esc(s["summary"])}</p><p class="from">{sources_line(s["summary_articles"], by_id)}</p>'
     if s["updates"]:
         body += '<ul class="updates">' + "".join(
-            f'<li><time>{when(at)}</time> {esc(text)} <span class="from">Sources: '
-            + ", ".join(link(by_id[a][4], by_id[a][1]) for a in json.loads(ids) if a in by_id) + "</span></li>"
+            f'<li><time>{when(at)}</time> {esc(text)} <span class="from">{sources_line(ids, by_id)}</span></li>'
             for at, text, ids in s["updates"]) + "</ul>"
     if s["quotes"]:
         body += '<ul class="quotes">' + "".join(
@@ -595,7 +624,8 @@ def render(db):
     for r in rows:
         by_story[r[0]].append(r)
     written = {r[0]: r[1:] for r in db.execute(
-        "SELECT id, headline, summary, region FROM stories WHERE updated >= ? AND headline IS NOT NULL", since)}
+        "SELECT id, headline, summary, region, summary_articles FROM stories WHERE updated >= ? AND headline IS NOT NULL",
+        since)}
     updates, quotes = defaultdict(list), defaultdict(list)
     for r in db.execute("""SELECT u.story, u.at, u.text, u.articles FROM updates u JOIN stories s ON s.id = u.story
                            WHERE s.updated >= ? ORDER BY u.at""", since):
@@ -609,11 +639,11 @@ def render(db):
         sources = source_count([(a[1], a[7]) for a in arts])
         if sources < 2 and all(a[6] for a in arts):
             continue  # a lone opinion column waits until the topic gets more coverage
-        headline, summary, region = written.get(sid, (None, None, None))
+        headline, summary, region, summary_articles = written.get(sid, (None, None, None, None))
         # Once written, the region is Mistral's reading of what the story is about; before that, the outlets' regions.
         regions = ([region] if region else []) if headline else sorted({a[2] for a in arts if a[2]})
         stories.append(dict(arts=arts, sources=sources, headline=headline, summary=summary, regions=regions,
-                            updates=updates[sid], quotes=quotes[sid]))
+                            summary_articles=summary_articles, updates=updates[sid], quotes=quotes[sid]))
     stories.sort(key=lambda s: (s["sources"], s["arts"][-1][5]), reverse=True)
     multi = [s for s in stories if s["sources"] > 1]
     single = [s for s in stories if s["sources"] == 1]

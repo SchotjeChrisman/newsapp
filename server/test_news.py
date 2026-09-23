@@ -15,6 +15,7 @@ import numpy as np
 import news
 
 UTC = timezone.utc
+SOURCES = news.SOURCES
 
 RSS = b"""<?xml version="1.0"?>
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel>
@@ -201,10 +202,16 @@ def test_language_backfill():
         old = news.sqlite3.connect(path)
         old.execute("CREATE TABLE articles(id INTEGER PRIMARY KEY, url TEXT UNIQUE, outlet TEXT, region TEXT, title TEXT,"
                     " summary TEXT, published TEXT, opinion INTEGER, vec BLOB, story INTEGER)")
-        old.executemany("INSERT INTO articles(url, region) VALUES (?, ?)", [("https://a", "Zwolle"), ("https://b", "US")])
+        old.executemany("INSERT INTO articles(url, outlet, region) VALUES (?, ?, ?)",
+                        [("https://a", "RTV Oost", "Zwolle"), ("https://b", "CNN", "US"), ("https://c", "Tweakers", None),
+                         ("https://d", "NL Times", "NL")])
         old.commit()
         old.close()
-        assert news.connect(path).execute("SELECT lang FROM articles ORDER BY id").fetchall() == [("nl",), ("en",)]
+        db = news.connect(path)
+        news.SOURCES = SOURCES
+        news.translate(db)  # nothing recent to translate, so no request goes out
+        assert db.execute("SELECT lang FROM articles ORDER BY id").fetchall() == [("nl",), ("en",), ("nl",), ("en",)], \
+            "regions decide the language, except where sources.toml says otherwise"
 
 
 def test_write():
@@ -216,6 +223,7 @@ def test_write():
     add_article(db, 3, 1, "Trouw", "Waarom dit kabinet moest vallen", opinion=1, lang="nl",
                 summary="Het kabinet had geen plan meer voor de asielcrisis.")
     add_article(db, 4, 2, "Trouw", "Een column zonder nieuws", opinion=1, lang="nl")
+    add_article(db, 8, 1, "Tubantia", "Kabinet valt", lang="nl")  # a sister paper's word-for-word copy
     calls = []
 
     def fake(model, system, payload, max_tokens):
@@ -232,13 +240,16 @@ def test_write():
 
     news.call_mistral = fake
     news.write(db)
-    assert [[a["title"] for a in st["articles"]] for _, p in calls for st in p["stories"]] == [
-        ["Kabinet valt", "Dutch cabinet falls", "Waarom dit kabinet moest vallen"]], "a lone opinion column waits for more coverage"
+    [(_, first)] = calls
+    [story] = first["stories"]
+    assert [a["title"] for a in story["articles"]] == ["Kabinet valt", "Dutch cabinet falls", "Waarom dit kabinet moest vallen"], \
+        "a lone opinion column waits for more coverage, and a copy goes in once"
+    assert story["articles"][0]["also_in"] == ["Tubantia"] and story["source_count"] == 3
     assert db.execute("SELECT headline, summary, region FROM stories WHERE id = 1").fetchone() == (
         "Dutch cabinet falls", "The cabinet fell.", "NL")
     assert db.execute("SELECT quote_en FROM quotes").fetchall() == [("The cabinet had no plan left",)], \
         "only word-for-word quotes from opinion articles"
-    assert db.execute("SELECT id FROM articles WHERE written = 1 ORDER BY id").fetchall() == [(1,), (2,), (3,)]
+    assert db.execute("SELECT id FROM articles WHERE written = 1 ORDER BY id").fetchall() == [(1,), (2,), (3,), (8,)]
     assert abs(db.execute("SELECT usd FROM spend").fetchone()[0] - (1000 * 0.15 + 500 * 0.6) / 1e6) < 1e-12
 
     add_article(db, 5, 1, "NOS", "Koning aanvaardt ontslag", lang="nl")
@@ -252,13 +263,17 @@ def test_write():
 
     page = news.render(db)
     assert "The king accepted the resignation." in page and "The cabinet had no plan left" in page
+    assert page.count(">Tubantia</a>") == 1, "the summary names the sources it was written from"
     assert "Een column zonder nieuws" not in page
 
     add_article(db, 7, 1, "AD", "Kabinet valt, koning aanvaardt ontslag", lang="nl")
-    news.call_mistral = lambda *_: (json.dumps({"stories": [{"key": ["s1"]}, "junk", {"key": "s1", "update": 5,
-                                                              "sources": [["a1"]], "quotes": [{"article": {}}]}]}), (10, 10))
-    news.write(db)  # malformed replies are ignored, not fatal
-    assert db.execute("SELECT COUNT(*) FROM updates").fetchone()[0] == 1
+    for reply in ({"stories": [{"key": ["s1"]}, "junk", {"key": "s1", "update": 5, "sources": [["a1"]],
+                                                          "quotes": [{"article": {}}]}]},
+                  {"stories": None}, {"stories": 3}, [], {"stories": [{"key": "s1", "update": "x", "sources": 2}]}):
+        news.call_mistral = lambda *_: (json.dumps(reply), (10, 10))
+        db.execute("UPDATE articles SET written = 0 WHERE id = 7")
+        news.write(db)  # malformed replies are skipped, never fatal
+    assert db.execute("SELECT text FROM updates ORDER BY id").fetchall() == [("The king accepted the resignation.",), ("x",)]
 
     db.execute("UPDATE spend SET usd = ?", (news.DAILY_BUDGET,))
     add_article(db, 6, 1, "BBC", "King accepts resignation")
