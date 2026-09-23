@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: docker build -t news server
+      - run: docker build -t news -f server/Containerfile server
       - run: docker run --rm -v "$PWD/server:/app" news python test_news.py
       - run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}:latest"
