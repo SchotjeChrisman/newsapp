@@ -339,6 +339,7 @@ def regroup(db):
     db.execute(f"DELETE FROM quotes WHERE story IN ({rebuilt})")
     db.execute(f"UPDATE articles SET story = NULL, written = 0 WHERE story IN ({rebuilt})")
     db.execute("DELETE FROM stories WHERE vec IS NOT NULL")
+    db.execute("DELETE FROM search_index")  # new stories reuse the old ids; the next index() starts over
     group(db)
 
 
@@ -1138,8 +1139,8 @@ def index(db):
     db.commit()
 
 
-def search(db, query, most=50):
-    """Stories of any age with every word of the query, most recent first. Words of 4 letters or more also match as the
+def search(db, query, most=100):
+    """The 100 most recent stories, of any age, with every word of the query. Words of 4 letters or more also match as the
     start of a word ("zwol" finds Zwolle); accents don't matter."""
     words = re.findall(r"\w+", query)[:8]
     if not words:

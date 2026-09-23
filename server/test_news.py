@@ -176,8 +176,10 @@ def test_group():
     assert story("a3") == story("a1"), "a later run joins an existing story"
     assert db.execute("SELECT n FROM stories WHERE id = ?", (story("a1"),)).fetchone()[0] == 3
 
+    news.index(db)
     news.regroup(db)
     assert story("a1") == story("a2") == story("a3") != story("b1"), "regroup rebuilds the same stories"
+    assert db.execute("SELECT COUNT(*) FROM search_index").fetchone() == (0,), "and the search index starts over"
     assert db.execute("SELECT COUNT(*) FROM stories s WHERE n != (SELECT COUNT(*) FROM articles WHERE story = s.id)"
                       ).fetchone()[0] == 0
 
