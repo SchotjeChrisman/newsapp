@@ -1,0 +1,9 @@
+FROM docker.io/library/python:3.13-slim
+RUN pip install --no-cache-dir fastembed==0.8.1
+ENV NEWS_MODELS=/models TZ=Europe/Amsterdam
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2', cache_dir='/models')"
+WORKDIR /app
+COPY news.py sources.toml ./
+VOLUME /data
+EXPOSE 8080
+CMD ["python", "news.py"]

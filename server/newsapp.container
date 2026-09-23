@@ -1,0 +1,20 @@
+# Rootless Podman service. On the server, once:
+#   cp newsapp.container ~/.config/containers/systemd/
+#   loginctl enable-linger                                   # start at boot, keep running after logout
+#   systemctl --user enable --now podman-auto-update.timer   # pull new images daily
+#   systemctl --user daemon-reload && systemctl --user start newsapp
+[Unit]
+Description=Private news server
+
+[Container]
+Image=ghcr.io/schotjechrisman/newsapp:latest
+AutoUpdate=registry
+Volume=newsapp-data:/data
+PublishPort=8080:8080
+# Environment=NEWS_THRESHOLD=0.6
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

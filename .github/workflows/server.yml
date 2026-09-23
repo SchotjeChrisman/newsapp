@@ -1,0 +1,21 @@
+name: server
+on:
+  push:
+    branches: [main]
+    paths: [server/**, .github/workflows/server.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t news server
+      - run: docker run --rm -v "$PWD/server:/app" news python test_news.py
+      - run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:latest"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag news "$image"
+          docker push "$image"
