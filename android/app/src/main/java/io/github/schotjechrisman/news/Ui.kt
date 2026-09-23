@@ -89,10 +89,11 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -234,14 +235,27 @@ fun NavRail(current: Screen, onSelect: (Screen) -> Unit) {
 
 /** Wide enough for the rail instead of the bottom bar. */
 @Composable
-fun wide() = LocalConfiguration.current.screenWidthDp >= 600
+fun wide() = with(LocalDensity.current) { LocalWindowInfo.current.containerSize.width.toDp() } >= 600.dp
+
+/** Too short for a big title: a phone on its side. */
+@Composable
+private fun short() = with(LocalDensity.current) { LocalWindowInfo.current.containerSize.height.toDp() } < 480.dp
+
+/** The title's scrolling: it shrinks as the page scrolls, except on a short screen, where the one-row bar stays put so
+ *  its menu stays in reach. Turning the phone starts with the title open. */
+@Composable
+private fun titleScroll(state: TopAppBarState): TopAppBarScrollBehavior {
+    val short = short()
+    LaunchedEffect(short) { state.heightOffset = 0f }
+    return if (short) TopAppBarDefaults.pinnedScrollBehavior(state) else TopAppBarDefaults.exitUntilCollapsedScrollBehavior(state)
+}
 
 /** A big title that shrinks as the page scrolls, on the page's own color; a small one when the screen is short. */
 @Composable
 private fun TitleBar(title: String, scroll: TopAppBarScrollBehavior, actions: @Composable () -> Unit = {}) {
     val ground = MaterialTheme.colorScheme.surface
     val colors = TopAppBarDefaults.topAppBarColors(containerColor = ground, scrolledContainerColor = ground)
-    if (LocalConfiguration.current.screenHeightDp < 480) {
+    if (short()) {
         TopAppBar(title = { Text(title) }, actions = { actions() }, scrollBehavior = scroll, colors = colors)
     } else {
         MediumTopAppBar(title = { Text(title) }, actions = { actions() }, scrollBehavior = scroll, colors = colors)
@@ -264,7 +278,7 @@ fun StoriesScreen(
     bottomBar: @Composable () -> Unit,
 ) {
     var menu by remember { mutableStateOf(false) }
-    val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(barState)
+    val scroll = titleScroll(barState)
     Scaffold(
         topBar = {
             TitleBar("News", scroll) {
@@ -473,7 +487,7 @@ fun ReportScreen(
     onOpen: (Long) -> Unit,
     bottomBar: @Composable () -> Unit,
 ) {
-    val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(barState)
+    val scroll = titleScroll(barState)
     Scaffold(
         modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
         topBar = { TitleBar("Morning report", scroll) },

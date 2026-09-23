@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -23,8 +24,10 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.rememberTopAppBarState
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.TopAppBarState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -53,14 +56,23 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        // No grey scrim behind three-button navigation: the app's own bar is already there.
-        if (Build.VERSION.SDK_INT >= 29) window.isNavigationBarContrastEnforced = false
         if (savedInstanceState == null) state.openReport = intent.getBooleanExtra(MorningReport.OPEN, false)
         MorningReport.ensure(this)
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             askToNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
-        setContent { NewsTheme { App(state) } }
+        setContent {
+            // Fixed light or dark bars, set again when the theme changes: the automatic style lets the system lay a
+            // grey scrim over three-button navigation, where the app's own bar already is.
+            val dark = isSystemInDarkTheme()
+            DisposableEffect(dark) {
+                val bars = if (dark) SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                else SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+                enableEdgeToEdge(bars, bars)
+                onDispose {}
+            }
+            NewsTheme { App(state) }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -178,9 +190,10 @@ fun App(state: NewsState) {
     var query by rememberSaveable { mutableStateOf("") }
     // Scroll positions of the main places (one per tab for the news), kept while a story is open or another place shows.
     val lists = remember { mutableMapOf<String, LazyListState>() }
-    val newsBar = rememberTopAppBarState()
+    // Not saved like the others, because the news lists aren't: after a restart both start at the top.
+    val newsBar = remember { TopAppBarState(-Float.MAX_VALUE, 0f, 0f) }
     val reportList = rememberLazyListState()
-    val reportBar = rememberTopAppBarState()
+    val reportBar = remember { TopAppBarState(-Float.MAX_VALUE, 0f, 0f) }
     val searchList = rememberLazyListState()
     val news = state.news
     val rail = wide()
