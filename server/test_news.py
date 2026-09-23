@@ -540,6 +540,35 @@ def test_morning():
     news.urllib.request.urlopen = urlopen
 
 
+def test_search():
+    db = news.connect()
+    old = news.iso(news.now() - timedelta(days=30))
+    db.execute("INSERT INTO stories(id, updated, n, headline, summary) VALUES (1, ?, 2, 'PEC Zwolle beats Ajax', 'A 2-1 win.'),"
+               " (2, ?, 1, 'Cabinet falls', 'The coalition broke up over 100% of the plan.'), (3, ?, 1, NULL, NULL),"
+               " (4, ?, 1, 'Column on PEC Zwolle', 'An opinion.')", (old, news.iso(news.now()), old, old))
+    add_article(db, 1, 1, "RTV Oost", "PEC Zwolle wint van Ajax", age=timedelta(days=30))
+    add_article(db, 2, 1, "De Stentor", "PEC verslaat Ajax", age=timedelta(days=30))
+    add_article(db, 3, 2, "NOS", "Kabinet gevallen")
+    add_article(db, 5, 3, "AD", "Brand in Zwolle", age=timedelta(days=30))
+    add_article(db, 6, 4, "Trouw", "Column over PEC Zwolle", opinion=1, age=timedelta(days=30))
+    news.index(db)
+    assert [st["id"] for st in news.search(db, "pec ajax")] == [1], "every word, any case, older than the app's 48 hours"
+    assert [st["id"] for st in news.search(db, "kabinet")] == [2], "Dutch article titles count"
+    assert [st["id"] for st in news.search(db, "zwol")] == [1, 3], "the start of a word; a lone opinion column stays out"
+    assert not news.search(db, "ov") and not news.search(db, "   ") and news.search(db, '"cabinet* (')
+    [story] = news.search(db, "brand")
+    assert story["headline"] == "Brand in Zwolle" and story["summary"] is None, "unwritten stories show their article title"
+    db.execute("INSERT INTO updates(story, at, text, articles) VALUES (2, ?, 'The king accepted the resignation.', '[3]')",
+               (news.iso(news.now()),))
+    db.execute("UPDATE stories SET headline = 'Mbappé scores' WHERE id = 1")
+    news.index(db)
+    assert [st["id"] for st in news.search(db, "king resignation")] == [2], "recent stories are indexed again with updates"
+    assert not news.search(db, "mbappe"), "old stories keep their index"
+    db.execute("DELETE FROM search_index")
+    news.index(db)
+    assert [st["id"] for st in news.search(db, "mbappe")] == [1], "accents don't matter"
+
+
 def test_http():
     server = news.ThreadingHTTPServer(("127.0.0.1", 0), news.Page)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -547,6 +576,8 @@ def test_http():
     with urllib.request.urlopen(urllib.request.Request(base + "/api/stories", headers={"Accept-Encoding": "gzip"})) as r:
         assert r.headers["Content-Encoding"] == "gzip" and r.headers["Content-Type"] == "application/json"
         assert json.loads(gzip.decompress(r.read()))["stories"] == []
+    with urllib.request.urlopen(base + "/api/search?q=pec+zwolle") as r:
+        assert json.loads(r.read()) == {"stories": []}
     with urllib.request.urlopen(base + "/api/report") as r:
         assert r.read() == b"null"
     with urllib.request.urlopen(base + "/") as r:
@@ -573,5 +604,6 @@ test_write()
 test_claude_writer()
 test_tag()
 test_morning()
+test_search()
 test_http()
 print("ok")
