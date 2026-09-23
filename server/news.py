@@ -666,8 +666,8 @@ def when(published):
 
 
 def independent(pairs):
-    """One outlet per independent source of a story, from (outlet, headline) pairs. Identical headlines (syndicated
-    copies, like one DPG article in AD, Tubantia and De Stentor) make their outlets count as one source."""
+    """The outlets of a story grouped per independent source, from (outlet, headline) pairs. Identical headlines
+    (syndicated copies, like one DPG article in AD, Tubantia and De Stentor) put their outlets in one group."""
     parent = {outlet: outlet for outlet, _ in pairs}
 
     def root(outlet):
@@ -682,11 +682,24 @@ def independent(pairs):
             parent[root(outlet)] = root(first[title])
         else:
             first[title] = outlet
-    return {root(outlet) for outlet in parent}
+    groups = defaultdict(list)
+    for outlet in parent:
+        groups[root(outlet)].append(outlet)
+    return list(groups.values())
 
 
 def source_count(pairs):
     return len(independent(pairs))
+
+
+def lean_counts(pairs, lean):
+    """Independent sources per lean; a group of copies takes the lean of the first rated outlet in it."""
+    counts = dict.fromkeys(["left", "center", "right"], 0)
+    for group in independent(pairs):
+        rated = [lean[outlet_key(outlet)] for outlet in group if outlet_key(outlet) in lean]
+        if rated:
+            counts[rated[0]] += 1
+    return counts
 
 
 def article_html(a):
@@ -917,17 +930,13 @@ def api(db):
     for s in shown(db):
         arts = s["arts"]
         by_id = {a[8]: a for a in arts}
-        counts = dict.fromkeys(["left", "center", "right"], 0)
-        for outlet in independent([(a[1], a[7]) for a in arts]):
-            if outlet_key(outlet) in lean:
-                counts[lean[outlet_key(outlet)]] += 1
 
         def refs(ids):
             return [{"outlet": outlet, "url": url} for outlet, url in cited(ids, by_id).items()]
 
         stories.append({
             "id": s["id"], "headline": s["headline"] or arts[0][3], "summary": s["summary"], "tabs": s["regions"],
-            "sources": s["sources"], "updated": arts[-1][5], "lean": counts, "summary_from": refs(s["summary_articles"]),
+            "sources": s["sources"], "updated": arts[-1][5], "lean": lean_counts([(a[1], a[7]) for a in arts], lean), "summary_from": refs(s["summary_articles"]),
             "updates": [{"at": at, "text": text, "from": refs(ids)} for at, text, ids in s["updates"]],
             "quotes": [{"text": quote_en, "outlet": outlet, "url": url, "translated": normalized(quote) != normalized(quote_en)}
                        for quote, quote_en, outlet, url in s["quotes"]],

@@ -84,6 +84,10 @@ def test_source_count():
     assert news.source_count(story) == 2, "identical headlines from sister papers count once"
     chained = [("AD", "X"), ("Tubantia", "X"), ("AD", "Y"), ("De Stentor", "Y"), ("NOS", "Z")]
     assert news.source_count(chained) == 2
+    lean = {news.outlet_key("AD"): "center", news.outlet_key("NOS"): "center"}
+    copies_first = [("Tubantia", "Brand in Zwolle"), ("AD", "Brand in Zwolle"), ("NOS", "Grote brand"), ("RTV Oost", "Brand")]
+    assert news.lean_counts(copies_first, lean) == {"left": 0, "center": 2, "right": 0}, \
+        "a group of copies takes the lean of its rated outlet, whoever published first"
 
 
 def test_collect():
