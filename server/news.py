@@ -26,7 +26,7 @@ from contextlib import closing
 from datetime import datetime, time as clock, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS updates(id INTEGER PRIMARY KEY, story INTEGER, at TEX
 CREATE TABLE IF NOT EXISTS quotes(id INTEGER PRIMARY KEY, story INTEGER, article INTEGER, quote TEXT, quote_en TEXT);
 CREATE TABLE IF NOT EXISTS spend(day TEXT PRIMARY KEY, usd REAL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS reports(day TEXT PRIMARY KEY, body TEXT);
+CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(text, tokenize='unicode61 remove_diacritics 2');
 """
 # Columns added after the first release; connect() adds them to older databases.
 COLUMNS = {"articles": ["lang TEXT", "title_en TEXT", "summary_en TEXT", "written INTEGER DEFAULT 0"],
@@ -338,6 +339,7 @@ def regroup(db):
     db.execute(f"DELETE FROM quotes WHERE story IN ({rebuilt})")
     db.execute(f"UPDATE articles SET story = NULL, written = 0 WHERE story IN ({rebuilt})")
     db.execute("DELETE FROM stories WHERE vec IS NOT NULL")
+    db.execute("DELETE FROM search_index")  # new stories reuse the old ids; the next index() starts over
     group(db)
 
 
@@ -929,27 +931,29 @@ def story_html(s):
             f'<div>{body}<ul class="articles">{items}</ul></div></article>')
 
 
-def shown(db):
-    """The stories with news in the last SHOW hours, most independent sources first."""
-    since = (iso(now() - SHOW),)
-    rows = db.execute("""SELECT a.story, a.outlet, a.region, COALESCE(a.title_en, a.title), a.url, a.published,
-                                a.opinion, a.title, a.id
-                         FROM articles a JOIN stories s ON s.id = a.story
-                         WHERE s.updated >= ? ORDER BY a.published""", since).fetchall()
+def shown(db, ids=None):
+    """The stories with news in the last SHOW hours, or the stories with these ids, most independent sources first."""
+    if ids is None:
+        where, params = "s.updated >= ?", (iso(now() - SHOW),)
+    else:
+        where, params = f"s.id IN ({','.join('?' * len(ids))})", tuple(ids)
+    rows = db.execute(f"""SELECT a.story, a.outlet, a.region, COALESCE(a.title_en, a.title), a.url, a.published,
+                                 a.opinion, a.title, a.id
+                          FROM articles a JOIN stories s ON s.id = a.story
+                          WHERE {where} ORDER BY a.published""", params).fetchall()
     by_story = defaultdict(list)
     for r in rows:
         by_story[r[0]].append(r)
     written = {r[0]: r[1:] for r in db.execute(
-        "SELECT id, headline, summary, region, summary_articles, interests FROM stories"
-        " WHERE updated >= ? AND headline IS NOT NULL",
-        since)}
+        "SELECT s.id, s.headline, s.summary, s.region, s.summary_articles, s.interests FROM stories s"
+        f" WHERE {where} AND s.headline IS NOT NULL", params)}
     updates, quotes = defaultdict(list), defaultdict(list)
-    for r in db.execute("""SELECT u.story, u.at, u.text, u.articles FROM updates u JOIN stories s ON s.id = u.story
-                           WHERE s.updated >= ? ORDER BY u.at, u.id""", since):
+    for r in db.execute(f"""SELECT u.story, u.at, u.text, u.articles FROM updates u JOIN stories s ON s.id = u.story
+                            WHERE {where} ORDER BY u.at, u.id""", params):
         updates[r[0]].append(r[1:])
-    for r in db.execute("""SELECT q.story, q.quote, q.quote_en, a.outlet, a.url FROM quotes q
-                           JOIN articles a ON a.id = q.article JOIN stories s ON s.id = q.story
-                           WHERE s.updated >= ? ORDER BY q.id""", since):
+    for r in db.execute(f"""SELECT q.story, q.quote, q.quote_en, a.outlet, a.url FROM quotes q
+                            JOIN articles a ON a.id = q.article JOIN stories s ON s.id = q.story
+                            WHERE {where} ORDER BY q.id""", params):
         quotes[r[0]].append(r[1:])
     stories = []
     for sid, arts in by_story.items():
@@ -1097,26 +1101,62 @@ toggle.addEventListener("click", () => {{
 """
 
 
+def story_json(s, lean):
+    """A story as the app gets it."""
+    arts = s["arts"]
+    by_id = {a[8]: a for a in arts}
+
+    def refs(ids):
+        return [{"outlet": outlet, "url": url} for outlet, url in cited(ids, by_id).items()]
+
+    return {
+        "id": s["id"], "headline": s["headline"] or arts[0][3], "summary": s["summary"],
+        "tabs": s["regions"] + s["interests"],
+        "sources": s["sources"], "updated": arts[-1][5], "lean": lean_counts([(a[1], a[7]) for a in arts], lean), "summary_from": refs(s["summary_articles"]),
+        "updates": [{"at": at, "text": text, "from": refs(ids)} for at, text, ids in s["updates"]],
+        "quotes": [{"text": quote_en, "outlet": outlet, "url": url, "translated": normalized(quote) != normalized(quote_en)}
+                   for quote, quote_en, outlet, url in s["quotes"]],
+        "articles": [{"outlet": a[1], "title": a[3], "url": a[4], "published": a[5], "opinion": bool(a[6]),
+                      "lean": lean.get(outlet_key(a[1]))} for a in arts]}
+
+
+def index(db):
+    """Puts each story's headline, summary, updates and article titles (original and English) in the search index.
+    Stories that can still change are indexed again every run; the first run indexes all of them."""
+    first = db.execute("SELECT COUNT(*) FROM search_index").fetchone()[0] == 0
+    where, params = ("1", ()) if first else ("s.updated >= ?", (iso(now() - OPEN_FOR - timedelta(days=1)),))
+    texts = defaultdict(list)
+    for sid, *parts in db.execute(f"SELECT s.id, s.headline, s.summary FROM stories s WHERE {where}", params):
+        texts[sid] += parts
+    for sid, text in db.execute(f"SELECT u.story, u.text FROM updates u JOIN stories s ON s.id = u.story WHERE {where}", params):
+        texts[sid].append(text)
+    for sid, *titles in db.execute(f"SELECT a.story, a.title, a.title_en FROM articles a JOIN stories s ON s.id = a.story"
+                                   f" WHERE {where}", params):
+        texts[sid] += titles
+    db.executemany("DELETE FROM search_index WHERE rowid = ?", [(sid,) for sid in texts])
+    db.executemany("INSERT INTO search_index(rowid, text) VALUES (?, ?)",
+                   [(sid, " ".join(t for t in parts if t)) for sid, parts in texts.items()])
+    db.commit()
+
+
+def search(db, query, most=100):
+    """The 100 most recent stories, of any age, with every word of the query. Words of 4 letters or more also match as the
+    start of a word ("zwol" finds Zwolle); accents don't matter."""
+    words = re.findall(r"\w+", query)[:8]
+    if not words:
+        return []
+    match = " ".join(f'"{word}"*' if len(word) >= 4 else f'"{word}"' for word in words)
+    ids = [r[0] for r in db.execute("SELECT s.id FROM search_index JOIN stories s ON s.id = search_index.rowid"
+                                    " WHERE search_index MATCH ? ORDER BY s.updated DESC LIMIT ?", (match, most))]
+    order = {sid: i for i, sid in enumerate(ids)}
+    lean = leans()
+    return [story_json(s, lean) for s in sorted(shown(db, ids), key=lambda s: order[s["id"]])] if ids else []
+
+
 def api(db):
     """Everything the app shows in one document: the stories on the check page and the feed status."""
     lean = leans()
-    stories = []
-    for s in shown(db):
-        arts = s["arts"]
-        by_id = {a[8]: a for a in arts}
-
-        def refs(ids):
-            return [{"outlet": outlet, "url": url} for outlet, url in cited(ids, by_id).items()]
-
-        stories.append({
-            "id": s["id"], "headline": s["headline"] or arts[0][3], "summary": s["summary"],
-            "tabs": s["regions"] + s["interests"],
-            "sources": s["sources"], "updated": arts[-1][5], "lean": lean_counts([(a[1], a[7]) for a in arts], lean), "summary_from": refs(s["summary_articles"]),
-            "updates": [{"at": at, "text": text, "from": refs(ids)} for at, text, ids in s["updates"]],
-            "quotes": [{"text": quote_en, "outlet": outlet, "url": url, "translated": normalized(quote) != normalized(quote_en)}
-                       for quote, quote_en, outlet, url in s["quotes"]],
-            "articles": [{"outlet": a[1], "title": a[3], "url": a[4], "published": a[5], "opinion": bool(a[6]),
-                          "lean": lean.get(outlet_key(a[1]))} for a in arts]})
+    stories = [story_json(s, lean) for s in shown(db)]
     feeds = [{"name": name, "url": url, "items": items, "error": error, "checked": checked} for name, url, items, error, checked
              in db.execute("SELECT name, url, items, error, checked FROM sources ORDER BY error IS NULL, name")]
     return {"built": iso(now()), "tabs": REGIONS + list(INTERESTS), "stories": stories, "feeds": feeds,
@@ -1128,14 +1168,18 @@ HEAD = '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewpor
 
 class Page(BaseHTTPRequestHandler):
     def do_GET(self):
-        path = urlsplit(self.path).path
-        if path not in ("/", "/api/stories", "/api/report"):
+        url = urlsplit(self.path)
+        path = url.path
+        if path not in ("/", "/api/stories", "/api/report", "/api/search"):
             return self.send_error(404)
         with closing(connect()) as db:
             if path == "/":
                 body, kind = (HEAD + render(db)).encode(), "text/html; charset=utf-8"
             else:
-                data = api(db) if path == "/api/stories" else latest_report(db)
+                if path == "/api/search":
+                    data = {"stories": search(db, " ".join(parse_qs(url.query).get("q", [])))}
+                else:
+                    data = api(db) if path == "/api/stories" else latest_report(db)
                 body, kind = json.dumps(data, ensure_ascii=False).encode(), "application/json"
         packed = "gzip" in self.headers.get("Accept-Encoding", "")
         if packed:
@@ -1173,6 +1217,7 @@ def run():
                     grouped = started
                     write(db)
                     tag(db)
+                    index(db)
                 morning(db)
         except Exception:
             traceback.print_exc()
@@ -1189,4 +1234,4 @@ if __name__ == "__main__":
                 print(render(db))
             else:
                 {"collect": collect, "group": group, "regroup": regroup, "translate": translate, "write": write,
-                 "tag": tag, "morning": morning}[command](db)
+                 "tag": tag, "morning": morning, "index": index}[command](db)
