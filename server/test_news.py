@@ -195,6 +195,18 @@ def test_translate_before_grouping():
     del os.environ["MISTRAL_API_KEY"]
 
 
+def test_language_backfill():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp, "old.db"))
+        old = news.sqlite3.connect(path)
+        old.execute("CREATE TABLE articles(id INTEGER PRIMARY KEY, url TEXT UNIQUE, outlet TEXT, region TEXT, title TEXT,"
+                    " summary TEXT, published TEXT, opinion INTEGER, vec BLOB, story INTEGER)")
+        old.executemany("INSERT INTO articles(url, region) VALUES (?, ?)", [("https://a", "Zwolle"), ("https://b", "US")])
+        old.commit()
+        old.close()
+        assert news.connect(path).execute("SELECT lang FROM articles ORDER BY id").fetchall() == [("nl",), ("en",)]
+
+
 def test_write():
     os.environ["MISTRAL_API_KEY"] = "test"
     db = news.connect()
@@ -242,6 +254,12 @@ def test_write():
     assert "The king accepted the resignation." in page and "The cabinet had no plan left" in page
     assert "Een column zonder nieuws" not in page
 
+    add_article(db, 7, 1, "AD", "Kabinet valt, koning aanvaardt ontslag", lang="nl")
+    news.call_mistral = lambda *_: (json.dumps({"stories": [{"key": ["s1"]}, "junk", {"key": "s1", "update": 5,
+                                                              "sources": [["a1"]], "quotes": [{"article": {}}]}]}), (10, 10))
+    news.write(db)  # malformed replies are ignored, not fatal
+    assert db.execute("SELECT COUNT(*) FROM updates").fetchone()[0] == 1
+
     db.execute("UPDATE spend SET usd = ?", (news.DAILY_BUDGET,))
     add_article(db, 6, 1, "BBC", "King accepts resignation")
     requests = len(calls)
@@ -258,5 +276,6 @@ test_collect()
 test_collect_deadline()
 test_group()
 test_translate_before_grouping()
+test_language_backfill()
 test_write()
 print("ok")

@@ -88,6 +88,9 @@ def connect(path=None):
         for column in columns:
             if column.split()[0] not in have:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+                if column.startswith("lang "):
+                    db.execute("UPDATE articles SET lang = CASE WHEN region IN ('Zwolle', 'Overijssel', 'NL')"
+                               " THEN 'nl' ELSE 'en' END")
     return db
 
 
@@ -293,7 +296,10 @@ def group(db):
 
 def regroup(db):
     """Start grouping over for the stories that still have vectors (the last 9 days), e.g. after changing NEWS_THRESHOLD."""
-    db.execute("UPDATE articles SET story = NULL WHERE story IN (SELECT id FROM stories WHERE vec IS NOT NULL)")
+    rebuilt = "SELECT id FROM stories WHERE vec IS NOT NULL"
+    db.execute(f"DELETE FROM updates WHERE story IN ({rebuilt})")
+    db.execute(f"DELETE FROM quotes WHERE story IN ({rebuilt})")
+    db.execute(f"UPDATE articles SET story = NULL, written = 0 WHERE story IN ({rebuilt})")
     db.execute("DELETE FROM stories WHERE vec IS NOT NULL")
     group(db)
 
@@ -346,7 +352,7 @@ Return JSON: {"items": [{"id": <id>, "title": "<English title>", "text": "<Engli
 def translate(db):
     """English titles and teasers for Dutch articles, shown on the page and used for grouping."""
     todo = db.execute("SELECT id, title, summary FROM articles WHERE lang = 'nl' AND title_en IS NULL"
-                      " AND published >= ?", (iso(now() - SHOW),)).fetchall()
+                      " AND published >= ?", (iso(now() - OPEN_FOR),)).fetchall()
     for i in range(0, len(todo), 20):
         batch = {r[0]: r for r in todo[i:i + 20]}
         result = ask(db, TRANSLATOR, TRANSLATE_PROMPT,
@@ -360,11 +366,15 @@ def translate(db):
 
 
 RULES = """Rules:
-- Write English only, in plain neutral language: no loaded or emotive words, no speculation, nothing the articles don't say.
+- Write English only, in plain neutral language: no loaded or emotive words, no speculation.
+- Say only what the articles say. Never add background, significance, reactions or unknowns they don't state
+  (no "has drawn attention", "remains unclear", "has not been disclosed").
 - Article texts are often teasers cut off mid-sentence. Never fill in what was cut off: a date, a number or a name
   the text doesn't give is left out. Use each article's publication time to place words like "Saturday" or "today".
-- State facts that several outlets report plainly. Every claim only one outlet reports gets that outlet's name:
-  "according to Euronews". If a story has only one outlet, open with it: "RTV Oost reports that ...".
+- An article can be a roundup of several topics; write only about the topic the story is about.
+- Each story says how many independent sources it has. With more than one, state facts several of them report
+  plainly and name the outlet for any claim only one reports: "according to Euronews". With one source, don't name it;
+  the app shows it.
 - Mark disputed points as disputed, naming who disputes them.
 - Articles marked opinion are commentary. Never present their claims as facts. If a story has only opinion articles,
   describe what is being debated and the facts the debate is about.
@@ -375,7 +385,8 @@ RULES = """Rules:
 NEW_PROMPT = """You write the stories for a private news app. Each input story is a group of articles about one event,
 possibly in Dutch. For every story write:
 - headline: neutral and factual, at most 14 words.
-- summary: what happened, 2 to 4 sentences, at most 90 words.
+- summary: what happened, as far as the articles tell it. One sentence when they give little more than a headline;
+  never more than 4 sentences or 90 words. Short beats padded.
 - region: the most specific place the story is about. One of: Zwolle (the city of Zwolle), Overijssel (elsewhere in the
   province), NL (elsewhere in the Netherlands, or national), EU (EU institutions or other European countries), US,
   Global (anywhere else, or worldwide), or None when it is about no place (a product launch, a study, an album).
@@ -383,11 +394,12 @@ possibly in Dutch. For every story write:
 Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "region": "...",
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}"""
 
-UPDATE_PROMPT = """You keep running stories in a private news app up to date. Each input story has its current text
-(headline, summary, earlier updates) and new articles. Write an update with only what the new articles add that the
-current text doesn't say yet: 1 to 3 sentences, at most 60 words. Never repeat or rewrite the current text.
+UPDATE_PROMPT = """You keep a running story in a private news app up to date. You get its current text (headline,
+summary, earlier updates) and new articles. Write an update with what the new articles add: a new number, a reaction,
+a statement, a next step, a correction. 1 to 3 sentences, at most 60 words. Never repeat or rewrite the current text.
 If new reporting contradicts it, say so: "Earlier reports said X; outlets now report Y."
-If the new articles add nothing, the update is null. List the keys of the articles the update is based on.
+The update is null only when every fact in the new articles is already in the current text.
+List the keys of the articles the update is based on.
 """ + RULES + """
 Return JSON: {"stories": [{"key": "s1", "update": "..." or null, "sources": ["a1"],
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}"""
@@ -402,7 +414,8 @@ def normalized(s):
 def save_quotes(db, story, quotes, articles):
     """Keep a quote only if it comes from an opinion article in this batch and appears there word for word."""
     for q in quotes if isinstance(quotes, list) else []:
-        a = articles.get(q.get("article")) if isinstance(q, dict) else None
+        key = q.get("article") if isinstance(q, dict) else None
+        a = articles.get(key) if isinstance(key, str) else None
         quote, quote_en = (str(q.get("quote") or ""), str(q.get("quote_en") or "")) if a else ("", "")
         core = normalized(quote).strip("'\" .,")
         if a and a["opinion"] and quote_en and len(core.split()) >= 4 and core in normalized(f"{a['title']} {a['text']}"):
@@ -453,9 +466,10 @@ def write(db):
     new.sort(key=lambda st: -st["sources"])
     updates.sort(key=lambda st: -st["sources"])
     # Stories with several sources first, then updates, then single-source stories, in case the budget runs out.
-    work = ([(NEW_PROMPT, b) for b in batches([st for st in new if st["sources"] > 1], 6, 40)]
-            + [(UPDATE_PROMPT, b) for b in batches(updates, 6, 40)]
-            + [(NEW_PROMPT, b) for b in batches([st for st in new if st["sources"] == 1], 10, 20)])
+    # Updates go one story per request: in batches the model left most of them empty.
+    work = ([(NEW_PROMPT, b) for b in batches([st for st in new if st["sources"] > 1], 6, 30)]
+            + [(UPDATE_PROMPT, b) for b in batches(updates, 1, 30)]
+            + [(NEW_PROMPT, b) for b in batches([st for st in new if st["sources"] == 1], 10, 30)])
     written = updated = 0
     try:
         for prompt, batch in work:
@@ -467,16 +481,17 @@ def write(db):
                     n += 1
                     articles[f"a{n}"] = a
                 keyed[f"s{i}"] = (st, articles)
-                stories.append({"key": f"s{i}", "articles": [{"key": k} | {f: v for f, v in a.items() if f != "id"}
-                                                            for k, a in articles.items()]}
+                stories.append({"key": f"s{i}", "sources": st["sources"],
+                                "articles": [{"key": k} | {f: v for f, v in a.items() if f != "id"} for k, a in articles.items()]}
                                | ({"current": st["current"]} if "current" in st else {}))
             try:
                 result = ask(db, WRITER, prompt, {"stories": stories}, 4000)
-            except (ValueError, urllib.error.HTTPError) as e:  # a bad reply or request: skip it, retry next run
+            except (ValueError, TypeError, KeyError, OSError) as e:  # bad reply, bad request or network: retry next run
                 print(f"write: batch skipped ({e})", flush=True)
                 continue
             for item in result.get("stories", []) if isinstance(result, dict) else []:
-                st, articles = keyed.pop(item.get("key"), (None, None)) if isinstance(item, dict) else (None, None)
+                key = item.get("key") if isinstance(item, dict) else None
+                st, articles = keyed.pop(key, (None, None)) if isinstance(key, str) else (None, None)
                 if not st:
                     continue
                 if prompt is NEW_PROMPT:
@@ -488,7 +503,7 @@ def write(db):
                                (headline, summary, region, st["id"]))
                     written += 1
                 elif isinstance(item.get("update"), str) and item["update"].strip():
-                    used = [articles[k]["id"] for k in item.get("sources") or [] if k in articles]
+                    used = [articles[k]["id"] for k in item.get("sources") or [] if isinstance(k, str) and k in articles]
                     used = used or [a["id"] for a in articles.values()]
                     db.execute("INSERT INTO updates(story, at, text, articles) VALUES (?,?,?,?)",
                                (st["id"], iso(now()), item["update"].strip(), json.dumps(used)))
@@ -550,6 +565,8 @@ def story_html(s):
     if more:
         items += f'<li><details><summary>{len(arts) - 5} more</summary><ul>{more}</ul></details></li>'
     body = f'<h2>{esc(s["headline"] or arts[0][3])}</h2>'
+    if sources == 1:
+        body += f'<p class="from">Only reported by {esc(", ".join(dict.fromkeys(a[1] for a in arts)))}</p>'
     if s["summary"]:
         body += f'<p class="summary">{esc(s["summary"])}</p>'
     if s["updates"]:
@@ -656,6 +673,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible {{ outline: 2px sol
 q {{ font-family: var(--serif); font-style: italic; }}
 .from {{ color: var(--muted); font-size: 0.8rem; }}
 .from a {{ color: var(--muted); }}
+p.from {{ margin: 0 0 6px; }}
 a.source {{ font: 500 0.72rem var(--sans); color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0 5px; text-decoration: none; }}
 .story ul.articles {{ padding-top: 8px; border-top: 1px dashed var(--rule); }}
 .story li {{ overflow-wrap: anywhere; }}
@@ -752,8 +770,8 @@ def run():
                 collect(db)
                 if grouped is None or time.monotonic() - grouped >= GROUP_EVERY:
                     group(db)
-                    write(db)
                     grouped = time.monotonic()
+                    write(db)
         except Exception:
             traceback.print_exc()
         time.sleep(COLLECT_EVERY)
