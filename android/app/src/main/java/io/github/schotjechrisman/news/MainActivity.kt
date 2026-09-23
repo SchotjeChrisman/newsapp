@@ -66,31 +66,39 @@ class NewsState(context: Context) {
     }
 
     suspend fun refresh(staleAfterMinutes: Long = 0) {
-        if (news == null && cache.exists()) {
-            news = withContext(Dispatchers.IO) { runCatching { parse(cache.readText()) }.getOrNull() }
-        }
-        if (server.isBlank() || loading) return
-        if (fetched > 0 && SystemClock.elapsedRealtime() - fetched < staleAfterMinutes * 60_000) return
+        if (loading) return
         loading = true
-        error = null
+        val from = server
         try {
-            news = withContext(Dispatchers.IO) {
-                val json = download(server)
-                parse(json).also { cache.writeText(json) }
+            if (news == null && cache.exists()) {
+                news = withContext(Dispatchers.IO) { runCatching { parse(cache.readText()) }.getOrNull() }
             }
-            fetched = SystemClock.elapsedRealtime()
+            val stale = fetched == 0L || SystemClock.elapsedRealtime() - fetched >= staleAfterMinutes * 60_000
+            if (from.isNotBlank() && stale) {
+                error = null
+                val (fresh, json) = withContext(Dispatchers.IO) { download(from).let { parse(it) to it } }
+                if (server == from) {
+                    news = fresh
+                    fetched = SystemClock.elapsedRealtime()
+                    withContext(Dispatchers.IO) { cache.writeText(json) }
+                }
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            error = when (e) {
-                is UnknownHostException -> "Can't find $server. Is Tailscale on?"
-                is ConnectException, is SocketTimeoutException -> "Can't reach $server."
-                is JSONException -> "The server sent something the app can't read."
-                else -> "Couldn't load the news: ${e.message ?: e.javaClass.simpleName}"
+            if (server == from) {
+                error = when (e) {
+                    is UnknownHostException -> "Can't find $from. Is Tailscale on?"
+                    is ConnectException, is SocketTimeoutException -> "Can't reach $from."
+                    is JSONException -> "The server sent something the app can't read."
+                    else -> "Couldn't load the news: ${e.message ?: e.javaClass.simpleName}"
+                }
             }
         } finally {
             loading = false
         }
+        // The address changed while this was loading: fetch from the new one.
+        if (server != from) refresh()
     }
 }
 

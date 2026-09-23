@@ -44,6 +44,11 @@ android {
         compose = true
     }
 
+    // The app is English only; this also keeps the libraries' own strings English.
+    androidResources {
+        localeFilters += "en"
+    }
+
     experimentalProperties["android.experimental.enableScreenshotTest"] = true
 }
 
