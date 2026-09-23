@@ -314,7 +314,9 @@ def test_claude_writer():
                        (Run(json.dumps({"is_error": True, "result": "x", "api_error_status": 401}), 1), news.ClaudeUnavailable),
                        (Run(json.dumps({"is_error": True, "subtype": "error_max_turns"}), 1), news.ClaudeFailed),
                        (Run(json.dumps({"is_error": False, "result": "done"})), news.ClaudeFailed),
-                       (Run("not json"), news.ClaudeFailed)):
+                       (Run("not json"), news.ClaudeFailed),
+                       (Run("Error: unknown option '--tools'", 1), news.ClaudeUnavailable),
+                       (Run(json.dumps({"is_error": True, "result": "prompt exceeds the context limit"}), 1), news.ClaudeFailed)):
         news.subprocess.run = lambda cmd, **kw: run
         try:
             news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {})
@@ -373,6 +375,21 @@ def test_claude_writer():
     news.write(db)
     assert used == [news.CLAUDE_WRITER, news.CLAUDE_WRITER], "one failed request doesn't hand the run to Mistral"
     assert db.execute("SELECT COUNT(*) FROM stories WHERE headline = 'H'").fetchone()[0] == 1, "that batch waits"
+
+    for sid in (3, 4, 5):
+        db.execute("INSERT INTO stories(id, updated, n) VALUES (?, ?, 1)", (sid, news.iso(news.now())))
+        add_article(db, 10 + sid, sid, "AD", f"Story {sid}")
+    db.execute("UPDATE stories SET headline = NULL")
+    db.commit()
+    used.clear()
+
+    def broken(model, system, payload):
+        used.append(model)
+        raise news.ClaudeFailed("unreadable reply")
+
+    news.call_claude = broken
+    news.write(db)
+    assert used == [news.CLAUDE_WRITER] * 3 + [news.WRITER] * 3, "three failures in a row hand the run to Mistral"
     news.call_claude, news.call_mistral, news.batches = originals
     del os.environ["MISTRAL_API_KEY"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
 

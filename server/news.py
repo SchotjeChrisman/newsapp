@@ -365,10 +365,13 @@ def call_claude(model, system, payload):
     except ValueError:
         reply = None
     if not isinstance(reply, dict):
-        raise ClaudeFailed(f"unreadable reply: {(run.stdout or run.stderr).strip()[:200]}")
+        detail = f"unreadable reply: {(run.stdout or run.stderr).strip()[:200]}"
+        # Claude Code itself failing (a rejected flag, a crash) won't fix itself between batches.
+        raise (ClaudeUnavailable if run.returncode else ClaudeFailed)(detail)
     if reply.get("is_error") or run.returncode:
         detail = str(reply.get("result") or run.stderr.strip() or f"exit {run.returncode}")[:300]
-        if reply.get("api_error_status") in (401, 403, 429) or re.search(r"limit|authenticat|login|credit|billing", detail, re.I):
+        if reply.get("api_error_status") in (401, 403, 429) or re.search(
+                r"usage limit|rate limit|limit reached|authenticat|login|credit|billing", detail, re.I):
             raise ClaudeUnavailable(detail)
         raise ClaudeFailed(detail)
     if not isinstance(reply.get("structured_output"), dict):
@@ -572,7 +575,7 @@ def write(db):
     work = ([(NEW_PROMPT, b) for b in batches([st for st in new if st["sources"] > 1], 6, 30)]
             + [(UPDATE_PROMPT, b) for b in batches(updates, 1, 30)]
             + [(NEW_PROMPT, b) for b in batches([st for st in new if st["sources"] == 1], 10, 30)])
-    written = updated = 0
+    written = updated = failures = 0
     try:
         for prompt, batch in work:
             # Short keys per request: models copy "s2" and "a7" back reliably, long database ids not always.
@@ -591,8 +594,15 @@ def write(db):
                 while True:
                     try:
                         result = ask(db, writers[0], prompt, {"stories": stories}, 4000)
+                        failures = 0
                         break
-                    except ClaudeUnavailable as e:  # a limit or an outage: Mistral writes the rest of this run
+                    except ClaudeFailed as e:
+                        failures += 1
+                        if failures < 3 or writers[0] != CLAUDE_WRITER or len(writers) == 1:
+                            raise
+                        print(f"write: Claude failed three times in a row ({e}), switching to Mistral", flush=True)
+                        writers.pop(0)
+                    except ClaudeUnavailable as e:  # a usage limit or the login: Mistral writes the rest of this run
                         print(f"write: Claude unavailable ({e}), switching to Mistral", flush=True)
                         writers.pop(0)
                         if not writers:
