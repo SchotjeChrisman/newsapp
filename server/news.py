@@ -382,6 +382,8 @@ RULES = """Rules:
   given once, with the other outlets in also_in. With more than one source, state facts several sources report plainly
   and name the outlet for any claim only one source reports: "according to Euronews". With one source, don't name it;
   the app shows it.
+- Keep the hedges and attributions the articles use: "if", "for now", "according to experts", "officials say".
+  An article's view or analysis is reported as its view: "The Verge writes that ...".
 - Mark disputed points as disputed, naming who disputes them.
 - Articles marked opinion are commentary. Never present their claims as facts. If a story has only opinion articles,
   describe what is being debated and the facts the debate is about.
@@ -403,7 +405,7 @@ Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "re
 
 UPDATE_PROMPT = """You keep a running story in a private news app up to date. You get its current text (headline,
 summary, earlier updates) and new articles. For each new article that states something the current text doesn't have
-yet, write one English sentence with only what that article itself says, from its own title and text: nothing from
+yet, write at most one English sentence with only what that article itself says, from its own title and text: nothing from
 the current text or the other articles, and no day, date, number or name the article doesn't give. Skip articles that
 add nothing new; most stories need one or two sentences, some none.
 """ + RULES + """
@@ -530,10 +532,13 @@ def write(db):
                     else:
                         # One sentence per new article, each linked to that article (and its word-for-word copies).
                         facts = item.get("facts") if isinstance(item.get("facts"), list) else []
+                        cited = set()
                         for fact in facts:
                             key = fact.get("article") if isinstance(fact, dict) else None
                             text = fact.get("fact") if isinstance(fact, dict) else None
-                            if isinstance(key, str) and key in articles and isinstance(text, str) and text.strip():
+                            if (isinstance(key, str) and key in articles and key not in cited and isinstance(text, str)
+                                    and 0 < len(text.split()) <= 50):  # one short sentence per article, the first one
+                                cited.add(key)
                                 db.execute("INSERT INTO updates(story, at, text, articles) VALUES (?,?,?,?)",
                                            (st["id"], iso(now()), text.strip(), json.dumps(articles[key]["ids"])))
                                 updated += 1
@@ -641,7 +646,7 @@ def render(db):
         since)}
     updates, quotes = defaultdict(list), defaultdict(list)
     for r in db.execute("""SELECT u.story, u.at, u.text, u.articles FROM updates u JOIN stories s ON s.id = u.story
-                           WHERE s.updated >= ? ORDER BY u.at""", since):
+                           WHERE s.updated >= ? ORDER BY u.at, u.id""", since):
         updates[r[0]].append(r[1:])
     for r in db.execute("""SELECT q.story, q.quote, q.quote_en, a.outlet, a.url FROM quotes q
                            JOIN articles a ON a.id = q.article JOIN stories s ON s.id = q.story

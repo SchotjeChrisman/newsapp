@@ -246,6 +246,7 @@ def test_write():
                                              {"article": "a1", "quote": "Kabinet valt", "quote_en": "Not an opinion piece"}]}]}
         else:
             reply = {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "The king accepted the resignation."},
+                                                   {"article": "a1", "fact": "A second sentence from the same article."},
                                                    {"article": "a9", "fact": "From an article that isn't there."}]}]}
         return json.dumps(reply), (1000, 500)
 
