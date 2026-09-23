@@ -48,6 +48,17 @@ OPINION_TITLE = re.compile(r"^(opinion|opinie|column)\s*[|:]|\|\s*(opinion|opini
 TAG = re.compile(r"<[^>]+>")
 REGIONS = ["Zwolle", "Overijssel", "NL", "EU", "US", "Global"]
 DUTCH_REGIONS = {"Zwolle", "Overijssel", "NL"}  # sources there write Dutch unless sources.toml says otherwise
+# The reader's interests, each a tab in the app; the description tells the model what belongs in it.
+INTERESTS = {
+    "AI": "artificial intelligence: AI models and products, AI companies, chips for AI, AI rules, AI research",
+    "Tech": "technology: tech companies, software, apps, gadgets, the internet, telecom, cybersecurity",
+    "S&P 500": "the US stock market: the S&P 500 and other US indexes, results and share moves of large US-listed "
+               "companies, the Federal Reserve and economic news that moves US stocks",
+    "Science": "science: research findings, space, medicine and health research, climate and nature science",
+    "Football": "association football (soccer) anywhere in the world: clubs, players, transfers, leagues, national "
+                "teams. Not American football",
+    "Music": "music: artists, releases, charts, concerts, festivals, the music industry",
+}
 
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 WRITER = "mistral-small-2603"
@@ -77,7 +88,7 @@ CREATE TABLE IF NOT EXISTS spend(day TEXT PRIMARY KEY, usd REAL DEFAULT 0);
 """
 # Columns added after the first release; connect() adds them to older databases.
 COLUMNS = {"articles": ["lang TEXT", "title_en TEXT", "summary_en TEXT", "written INTEGER DEFAULT 0"],
-           "stories": ["headline TEXT", "summary TEXT", "region TEXT", "summary_articles TEXT"],
+           "stories": ["headline TEXT", "summary TEXT", "region TEXT", "summary_articles TEXT", "interests TEXT"],
            "spend": ["claude_usd REAL DEFAULT 0"]}
 
 
@@ -481,6 +492,14 @@ add nothing new; most stories need one or two sentences, some none.
 Return JSON: {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "..."}],
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}"""
 
+TAG_PROMPT = """You sort the stories of a private news app into the reader's interests. For each story, list the
+interests it is about, from these:
+""" + "\n".join(f"- {name}: {about}" for name, about in INTERESTS.items()) + """
+A story can have several interests or none; most stories have none. Pick an interest only when the story itself is
+about it, not when it comes up in passing. Include every story, with an empty list when no interest fits, and refer to
+stories by their key exactly as given ("s1").
+Return JSON: {"stories": [{"key": "s1", "interests": ["AI", "Tech"]}]}"""
+
 QUOTES_SCHEMA = {"type": "array", "items": {"type": "object", "required": ["article", "quote", "quote_en"],
                                              "properties": {"article": {"type": "string"}, "quote": {"type": "string"},
                                                             "quote_en": {"type": "string"}}}}
@@ -494,6 +513,9 @@ SCHEMAS = {
         "properties": {"key": {"type": "string"}, "quotes": QUOTES_SCHEMA, "facts": {"type": "array", "items": {
             "type": "object", "required": ["article", "fact"],
             "properties": {"article": {"type": "string"}, "fact": {"type": "string"}}}}}}}}},
+    TAG_PROMPT: {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
+        "type": "object", "required": ["key", "interests"],
+        "properties": {"key": {"type": "string"}, "interests": {"type": "array", "items": {"enum": list(INTERESTS)}}}}}}},
 }
 
 QUOTE_MARKS = str.maketrans({c: "'" for c in "‘’‚‛"} | {c: '"' for c in "“”„‟«»"})
@@ -549,10 +571,14 @@ def mistral_articles(rows):
     return kept
 
 
+def available_writers():
+    return ([CLAUDE_WRITER] if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") else []) + (
+        [WRITER] if os.environ.get("MISTRAL_API_KEY") else [])
+
+
 def write(db):
     """Claude or Mistral writes new stories and adds updates to written ones. Stories only an opinion column covers wait."""
-    writers = ([CLAUDE_WRITER] if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") else []) + (
-        [WRITER] if os.environ.get("MISTRAL_API_KEY") else [])
+    writers = available_writers()
     if not writers:
         return
     rows = db.execute("""SELECT a.story, a.id, a.outlet, a.published, a.opinion, a.title, a.summary, a.written,
@@ -655,6 +681,45 @@ def write(db):
                        (now().date().isoformat(),)).fetchone() or (0, 0)
     print(f"write: {written} new stories, {updated} updates; today Mistral ${spent[0]:.3f},"
           f" Claude ${spent[1]:.3f} API-equivalent", flush=True)
+
+
+def tag(db):
+    """Sorts the written stories into the reader's interests, 100 per request. A story is tagged once; a failed request
+    stops tagging until the next run."""
+    writers = available_writers()
+    rows = db.execute("SELECT id, headline, summary FROM stories WHERE updated >= ? AND headline IS NOT NULL"
+                      " AND interests IS NULL ORDER BY id", (iso(now() - SHOW),)).fetchall()
+    tagged, start = 0, 0
+    while start < len(rows) and writers:
+        batch = rows[start:start + 100]
+        keyed = {f"s{i}": sid for i, (sid, _, _) in enumerate(batch, 1)}
+        payload = {"stories": [{"key": f"s{i}", "headline": headline, "summary": summary}
+                               for i, (_, headline, summary) in enumerate(batch, 1)]}
+        try:
+            result = ask(db, writers[0], TAG_PROMPT, payload, 4000)
+            items = result.get("stories") if isinstance(result, dict) else None
+            for item in items if isinstance(items, list) else []:
+                key = item.get("key") if isinstance(item, dict) else None
+                sid = keyed.pop(key, None) if isinstance(key, str) else None
+                if sid:
+                    interests = item.get("interests")
+                    picked = [name for name in INTERESTS if isinstance(interests, list) and name in interests]
+                    db.execute("UPDATE stories SET interests = ? WHERE id = ?", (json.dumps(picked), sid))
+                    tagged += bool(picked)
+            if len(keyed) == len(batch):
+                raise ValueError("no story in the reply")
+            # Left out of a valid reply means no interest fits; sending them again would get the same answer.
+            db.executemany("UPDATE stories SET interests = '[]' WHERE id = ?", [(sid,) for sid in keyed.values()])
+            db.commit()
+            start += 100
+        except ClaudeUnavailable as e:
+            print(f"tag: Claude unavailable ({e}), switching to Mistral", flush=True)
+            writers.pop(0)
+        except (OverBudget, ValueError, TypeError, KeyError, AttributeError, OSError, http.client.HTTPException) as e:
+            db.rollback()
+            print(f"tag: stopped until the next run ({type(e).__name__}: {e})", flush=True)
+            break
+    print(f"tag: {tagged} stories have an interest", flush=True)
 
 
 def esc(s):
@@ -768,7 +833,8 @@ def shown(db):
     for r in rows:
         by_story[r[0]].append(r)
     written = {r[0]: r[1:] for r in db.execute(
-        "SELECT id, headline, summary, region, summary_articles FROM stories WHERE updated >= ? AND headline IS NOT NULL",
+        "SELECT id, headline, summary, region, summary_articles, interests FROM stories"
+        " WHERE updated >= ? AND headline IS NOT NULL",
         since)}
     updates, quotes = defaultdict(list), defaultdict(list)
     for r in db.execute("""SELECT u.story, u.at, u.text, u.articles FROM updates u JOIN stories s ON s.id = u.story
@@ -783,11 +849,12 @@ def shown(db):
         sources = source_count([(a[1], a[7]) for a in arts])
         if sources < 2 and all(a[6] for a in arts):
             continue  # a lone opinion column waits until the topic gets more coverage
-        headline, summary, region, summary_articles = written.get(sid, (None, None, None, None))
+        headline, summary, region, summary_articles, interests = written.get(sid, (None,) * 5)
         # Once written, the region is Mistral's reading of what the story is about; before that, the outlets' regions.
         regions = ([region] if region else []) if headline else sorted({a[2] for a in arts if a[2]})
         stories.append(dict(id=sid, arts=arts, sources=sources, headline=headline, summary=summary, regions=regions,
-                            summary_articles=summary_articles, updates=updates[sid], quotes=quotes[sid]))
+                            summary_articles=summary_articles, interests=json.loads(interests or "[]"),
+                            updates=updates[sid], quotes=quotes[sid]))
     stories.sort(key=lambda s: (s["sources"], s["arts"][-1][5]), reverse=True)
     return stories
 
@@ -935,7 +1002,8 @@ def api(db):
             return [{"outlet": outlet, "url": url} for outlet, url in cited(ids, by_id).items()]
 
         stories.append({
-            "id": s["id"], "headline": s["headline"] or arts[0][3], "summary": s["summary"], "tabs": s["regions"],
+            "id": s["id"], "headline": s["headline"] or arts[0][3], "summary": s["summary"],
+            "tabs": s["regions"] + s["interests"],
             "sources": s["sources"], "updated": arts[-1][5], "lean": lean_counts([(a[1], a[7]) for a in arts], lean), "summary_from": refs(s["summary_articles"]),
             "updates": [{"at": at, "text": text, "from": refs(ids)} for at, text, ids in s["updates"]],
             "quotes": [{"text": quote_en, "outlet": outlet, "url": url, "translated": normalized(quote) != normalized(quote_en)}
@@ -944,7 +1012,7 @@ def api(db):
                           "lean": lean.get(outlet_key(a[1]))} for a in arts]})
     feeds = [{"name": name, "url": url, "items": items, "error": error, "checked": checked} for name, url, items, error, checked
              in db.execute("SELECT name, url, items, error, checked FROM sources ORDER BY error IS NULL, name")]
-    return {"built": iso(now()), "tabs": REGIONS, "stories": stories, "feeds": feeds}
+    return {"built": iso(now()), "tabs": REGIONS + list(INTERESTS), "stories": stories, "feeds": feeds}
 
 
 HEAD = '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">'
@@ -989,6 +1057,7 @@ def run():
                     group(db)
                     grouped = time.monotonic()
                     write(db)
+                    tag(db)
         except Exception:
             traceback.print_exc()
         time.sleep(COLLECT_EVERY)
@@ -1003,4 +1072,5 @@ if __name__ == "__main__":
             if command == "page":
                 print(render(db))
             else:
-                {"collect": collect, "group": group, "regroup": regroup, "translate": translate, "write": write}[command](db)
+                {"collect": collect, "group": group, "regroup": regroup, "translate": translate, "write": write,
+                 "tag": tag}[command](db)
