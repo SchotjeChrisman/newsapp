@@ -310,12 +310,16 @@ def test_claude_writer():
     assert news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {}) == ('{"ok": 1}', 0.01)
     assert json.loads(calls[0][calls[0].index("--json-schema") + 1]) == news.SCHEMAS[news.NEW_PROMPT]
     assert calls[0][calls[0].index("--tools") + 1] == "", "Claude Code's own tools are off"
-    for run in (Run(json.dumps({"is_error": True, "result": "Claude AI usage limit reached"}), 1), Run("not json")):
+    for run, error in ((Run(json.dumps({"is_error": True, "result": "Claude AI usage limit reached"}), 1), news.ClaudeUnavailable),
+                       (Run(json.dumps({"is_error": True, "result": "x", "api_error_status": 401}), 1), news.ClaudeUnavailable),
+                       (Run(json.dumps({"is_error": True, "subtype": "error_max_turns"}), 1), news.ClaudeFailed),
+                       (Run(json.dumps({"is_error": False, "result": "done"})), news.ClaudeFailed),
+                       (Run("not json"), news.ClaudeFailed)):
         news.subprocess.run = lambda cmd, **kw: run
         try:
             news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {})
-            raise AssertionError("expected ClaudeUnavailable")
-        except news.ClaudeUnavailable:
+            raise AssertionError(f"expected {error.__name__}")
+        except error:
             pass
     news.subprocess.run = real_run
 
@@ -332,7 +336,7 @@ def test_claude_writer():
 
     def claude(model, system, payload):
         used.append(model)
-        if len(used) > 1:
+        if len(used) == 2:
             raise news.ClaudeUnavailable("Claude AI usage limit reached")
         return reply(system, payload), 0.25
 
@@ -340,6 +344,7 @@ def test_claude_writer():
         used.append(model)
         return reply(system, payload), (100, 10)
 
+    originals = news.call_claude, news.call_mistral, news.batches
     news.call_claude, news.call_mistral = claude, mistral
     news.batches = lambda stories, max_stories, max_articles: ([st] for st in stories)  # one story per request
     news.write(db)
@@ -352,6 +357,23 @@ def test_claude_writer():
     used.clear()
     news.write(db)
     assert used == [news.WRITER, news.WRITER], "past the Claude budget, Mistral writes"
+
+    db.execute("UPDATE stories SET headline = NULL")
+    db.execute("UPDATE spend SET claude_usd = 0")
+    db.commit()
+    used.clear()
+
+    def flaky(model, system, payload):
+        used.append(model)
+        if len(used) == 1:
+            raise news.ClaudeFailed("no reply within 10 minutes")
+        return reply(system, payload), 0.25
+
+    news.call_claude = flaky
+    news.write(db)
+    assert used == [news.CLAUDE_WRITER, news.CLAUDE_WRITER], "one failed request doesn't hand the run to Mistral"
+    assert db.execute("SELECT COUNT(*) FROM stories WHERE headline = 'H'").fetchone()[0] == 1, "that batch waits"
+    news.call_claude, news.call_mistral, news.batches = originals
     del os.environ["MISTRAL_API_KEY"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
 
 

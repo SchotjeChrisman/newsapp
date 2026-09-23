@@ -338,7 +338,11 @@ def call_mistral(model, system, payload, max_tokens):
 
 
 class ClaudeUnavailable(Exception):
-    pass
+    """Claude can't write for now (a usage limit, the login, no CLI): Mistral writes the rest of the run."""
+
+
+class ClaudeFailed(ValueError):
+    """One request went wrong (a timeout, an unreadable reply): that batch is tried again next run."""
 
 
 def call_claude(model, system, payload):
@@ -352,31 +356,44 @@ def call_claude(model, system, payload):
     try:
         run = subprocess.run(cmd, input=json.dumps(payload, ensure_ascii=False), capture_output=True, text=True,
                              timeout=600)
-        reply = json.loads(run.stdout)
-    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+    except OSError as e:
         raise ClaudeUnavailable(f"{type(e).__name__}: {e}") from e
-    if not isinstance(reply, dict) or reply.get("is_error") or run.returncode:
-        detail = reply.get("result") if isinstance(reply, dict) else None
-        raise ClaudeUnavailable(str(detail or run.stderr.strip() or f"exit {run.returncode}")[:300])
-    return json.dumps(reply.get("structured_output")), float(reply.get("total_cost_usd") or 0)
+    except subprocess.TimeoutExpired as e:
+        raise ClaudeFailed("no reply within 10 minutes") from e
+    try:
+        reply = json.loads(run.stdout)
+    except ValueError:
+        reply = None
+    if not isinstance(reply, dict):
+        raise ClaudeFailed(f"unreadable reply: {(run.stdout or run.stderr).strip()[:200]}")
+    if reply.get("is_error") or run.returncode:
+        detail = str(reply.get("result") or run.stderr.strip() or f"exit {run.returncode}")[:300]
+        if reply.get("api_error_status") in (401, 403, 429) or re.search(r"limit|authenticat|login|credit|billing", detail, re.I):
+            raise ClaudeUnavailable(detail)
+        raise ClaudeFailed(detail)
+    if not isinstance(reply.get("structured_output"), dict):
+        raise ClaudeFailed("the reply has no structured output")
+    return json.dumps(reply["structured_output"]), float(reply.get("total_cost_usd") or 0)
 
 
 def ask(db, model, system, payload, max_tokens):
     """One JSON request within the day's budget; the cost is recorded before the reply is parsed."""
     day = now().date().isoformat()
-    db.execute("INSERT OR IGNORE INTO spend(day) VALUES (?)", (day,))
+    # Only read before the request: a write here would hold the database lock for as long as the model takes.
     usd, claude_usd = db.execute("SELECT COALESCE(usd, 0), COALESCE(claude_usd, 0) FROM spend WHERE day = ?",
-                                 (day,)).fetchone()
+                                 (day,)).fetchone() or (0, 0)
     if model.startswith("claude"):
         if claude_usd >= CLAUDE_DAILY_BUDGET:
             raise ClaudeUnavailable(f"daily Claude budget of ${CLAUDE_DAILY_BUDGET:.2f} (API-equivalent) reached")
         content, cost = call_claude(model, system, payload)
+        db.execute("INSERT OR IGNORE INTO spend(day) VALUES (?)", (day,))
         db.execute("UPDATE spend SET claude_usd = COALESCE(claude_usd, 0) + ? WHERE day = ?", (cost, day))
     else:
         if usd >= DAILY_BUDGET:
             raise OverBudget(f"daily Mistral budget of ${DAILY_BUDGET:.2f} reached")
         content, (tokens_in, tokens_out) = call_mistral(model, system, payload, max_tokens)
         cost = (tokens_in * PRICES[model][0] + tokens_out * PRICES[model][1]) / 1e6
+        db.execute("INSERT OR IGNORE INTO spend(day) VALUES (?)", (day,))
         db.execute("UPDATE spend SET usd = COALESCE(usd, 0) + ? WHERE day = ?", (cost, day))
     db.commit()
     return json.loads(content)
