@@ -23,7 +23,7 @@ import xml.etree.ElementTree as ET
 import zlib
 from collections import defaultdict
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as clock, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -44,7 +44,10 @@ REPORT_HOUR = 5
 MAJOR = {"Zwolle": 2, "Overijssel": 2, "NL": 5, "EU": 6, "US": 8, "Global": 10}
 REPORT_PER_REGION = 5
 REPORT_PER_INTEREST = 3
-SP500 = "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=1d&interval=1d"
+# The S&P 500's last close: CNBC's quote service, Yahoo's chart API when CNBC doesn't answer (Yahoo rate-limits often).
+CNBC = ("https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols=.SPX&requestMethod=itv"
+        "&noform=1&partnerId=2&fund=1&exthrs=1&output=json")
+YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=1d&interval=1d"
 # A story accepts articles published up to this long after its latest one; older feed items are skipped.
 OPEN_FOR = timedelta(hours=72)
 SHOW = timedelta(hours=48)
@@ -509,7 +512,7 @@ stories by their key exactly as given ("s1").
 Return JSON: {"stories": [{"key": "s1", "interests": ["AI", "Tech"]}]}"""
 
 REPORT_PROMPT = """You write the morning report of a private news app. For each story write one plain English sentence of at
-most 25 words that says what happened, including the latest update if there is one. Use only the given headline,
+most 18 words, two lines on a phone, that says what happened, including the latest update if there is one. Use only the given headline,
 summary and updates: no new facts, no opinions, no loaded words. The headline is shown above your sentence, so don't
 repeat it. Refer to stories by their key exactly as given ("s1").
 Return JSON: {"stories": [{"key": "s1", "gist": "..."}]}"""
@@ -740,17 +743,24 @@ def tag(db):
 
 
 def market():
-    """The S&P 500's last close and its change from the close before, or None when Yahoo doesn't answer."""
-    try:
-        with urllib.request.urlopen(urllib.request.Request(SP500, headers={"User-Agent": UA}), timeout=20) as response:
-            meta = json.load(response)["chart"]["result"][0]["meta"]
-        close, before = float(meta["regularMarketPrice"]), float(meta["chartPreviousClose"])
-        new_york = timezone(timedelta(seconds=meta["gmtoffset"]))
-        return {"name": "S&P 500", "close": round(close, 2), "change": round((close / before - 1) * 100, 2),
-                "date": datetime.fromtimestamp(meta["regularMarketTime"], new_york).date().isoformat()}
-    except (OSError, ValueError, KeyError, IndexError, TypeError, ZeroDivisionError) as e:
-        print(f"report: no S&P 500 close ({type(e).__name__}: {e})", flush=True)
-        return None
+    """The S&P 500's last close and its change from the close before, or None when neither source answers."""
+    for url in (CNBC, YAHOO):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=20) as response:
+                data = json.load(response)
+            if url == CNBC:
+                quote = data["FormattedQuoteResult"]["FormattedQuote"][0]
+                close, before = (float(quote[k].replace(",", "")) for k in ("last", "previous_day_closing"))
+                date = datetime.fromisoformat(quote["last_time"][:10]).date()
+            else:
+                meta = data["chart"]["result"][0]["meta"]
+                close, before = float(meta["regularMarketPrice"]), float(meta["chartPreviousClose"])
+                date = datetime.fromtimestamp(meta["regularMarketTime"], timezone(timedelta(seconds=meta["gmtoffset"]))).date()
+            return {"name": "S&P 500", "close": round(close, 2), "change": round((close / before - 1) * 100, 2),
+                    "date": date.isoformat()}
+        except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError, ZeroDivisionError) as e:
+            print(f"report: no S&P 500 close from {urlsplit(url).hostname} ({type(e).__name__}: {e})", flush=True)
+    return None
 
 
 def gists(db, stories):
@@ -765,7 +775,7 @@ def gists(db, stories):
             items = result.get("stories") if isinstance(result, dict) else None
             for item in items if isinstance(items, list) else []:
                 key, gist = (item.get("key"), item.get("gist")) if isinstance(item, dict) else (None, None)
-                if isinstance(key, str) and key in keyed and isinstance(gist, str) and 0 < len(gist.split()) <= 40:
+                if isinstance(key, str) and key in keyed and isinstance(gist, str) and 0 < len(gist.split()) <= 30:
                     first[keyed[key]] = gist.strip()
             break
         except (ClaudeUnavailable, OverBudget, ValueError, TypeError, KeyError, AttributeError, OSError,
@@ -778,11 +788,21 @@ def morning(db, t=None):
     """Builds the day's morning report once the REPORT_HOUR run is done: the S&P 500's last close, the major stories of
     the last 24 hours per region, and the top stories per interest."""
     t = t or datetime.now().astimezone()
-    end = t.replace(hour=REPORT_HOUR, minute=0, second=0, microsecond=0)
+    end = datetime.combine(t.date(), clock(REPORT_HOUR)).astimezone()
     day = end.date().isoformat()
-    if t < end or db.execute("SELECT 1 FROM reports WHERE day = ?", (day,)).fetchone():
+    if t < end:
         return
-    since = iso(end - timedelta(days=1))
+    row = db.execute("SELECT body FROM reports WHERE day = ?", (day,)).fetchone()
+    if row:
+        body = json.loads(row[0])
+        if body["market"] is None and t.hour < 12:  # no close when the report was built: try again until noon
+            body["market"] = market()
+            if body["market"]:
+                db.execute("UPDATE reports SET body = ? WHERE day = ?", (json.dumps(body), day))
+                db.commit()
+        return
+    # Local midnight arithmetic, so a night with a clock change still starts the window at REPORT_HOUR.
+    since = iso(datetime.combine(end.date() - timedelta(days=1), clock(REPORT_HOUR)).astimezone())
     stories = [s for s in shown(db) if s["headline"] and any(a[5] >= since for a in s["arts"])]
     sections, picked = [], set()
     for region in REGIONS:

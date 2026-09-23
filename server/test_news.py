@@ -497,6 +497,15 @@ def test_morning():
     news.morning(db, fixed.astimezone())
     assert db.execute("SELECT COUNT(*) FROM reports").fetchone() == (1,), "one report a day"
     assert news.api(db)["report"] == report
+    assert report["since"] == "2026-09-22T03:00:00+00:00", "the 24 hours before 05:00 local"
+
+    news.market = lambda: None
+    db.execute("DELETE FROM reports")
+    news.morning(db, fixed.astimezone())
+    assert news.latest_report(db)["market"] is None
+    news.market = lambda: {"name": "S&P 500", "close": 6000.0, "change": 0.1, "date": "2026-09-22"}
+    news.morning(db, fixed.astimezone())
+    assert news.latest_report(db)["market"]["change"] == 0.1, "a missing close is fetched again later that morning"
 
     os.environ["MISTRAL_API_KEY"] = "test"
     news.call_mistral = lambda *_: (json.dumps({"stories": [{"key": "s2", "gist": "The cabinet fell."},
@@ -514,11 +523,19 @@ def test_morning():
     assert news.group_slot(local.replace(hour=1)) == local.replace(hour=23, minute=0) - timedelta(days=1)
 
     urlopen = news.urllib.request.urlopen
-    chart = {"chart": {"result": [{"meta": {"regularMarketPrice": 6030.0, "chartPreviousClose": 6000.0,
+    cnbc = {"FormattedQuoteResult": {"FormattedQuote": [{"last": "6,030.00", "previous_day_closing": "6,000.00",
+                                                         "last_time": "2026-09-23T16:59:59.000-0400"}]}}
+    yahoo = {"chart": {"result": [{"meta": {"regularMarketPrice": 5970.0, "chartPreviousClose": 6000.0,
                                             "regularMarketTime": 1790193600, "gmtoffset": -14400}}]}}
-    news.urllib.request.urlopen = lambda *a, **k: io.BytesIO(json.dumps(chart).encode())
+
+    def answers(replies):
+        return lambda request, **_: io.BytesIO(replies[request.full_url])
+
+    news.urllib.request.urlopen = answers({news.CNBC: json.dumps(cnbc).encode(), news.YAHOO: b"Too Many Requests"})
     assert news.market() == {"name": "S&P 500", "close": 6030.0, "change": 0.5, "date": "2026-09-23"}
-    news.urllib.request.urlopen = lambda *a, **k: io.BytesIO(b"<html>")
+    news.urllib.request.urlopen = answers({news.CNBC: b"<html>", news.YAHOO: json.dumps(yahoo).encode()})
+    assert news.market() == {"name": "S&P 500", "close": 5970.0, "change": -0.5, "date": "2026-09-23"}, "Yahoo stands in"
+    news.urllib.request.urlopen = answers({news.CNBC: b"<html>", news.YAHOO: b"Too Many Requests"})
     assert news.market() is None
     news.urllib.request.urlopen = urlopen
 
