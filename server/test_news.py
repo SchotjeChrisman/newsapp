@@ -214,6 +214,16 @@ def test_language_backfill():
             "regions decide the language, except where sources.toml says otherwise"
 
 
+def test_mistral_articles():
+    now = news.iso(news.now())
+    rows = [(1, 1, "1Zwolle", now, 0, "Brand bij rechtbank", "", 0, None), (1, 2, "Weblog Zwolle", now, 0, "Brand bij rechtbank", "Kort ontruimd.", 0, None),
+            (1, 3, "SCMP", now, 0, "Actress dies", "Died of an overdose.", 0, None), (1, 4, "PBS", now, 0, "Actress dies", "Found at home.", 0, None)]
+    merged, scmp, pbs = news.mistral_articles(rows)
+    assert (merged["ids"], merged["text"], merged["also_in"]) == ([1, 2], "Kort ontruimd.", ["Weblog Zwolle"]), \
+        "a copy without a teaser merges into one with a teaser, keeping the longest"
+    assert (scmp["ids"], pbs["ids"]) == ([3], [4]), "the same headline over different teasers isn't a copy"
+
+
 def test_write():
     os.environ["MISTRAL_API_KEY"] = "test"
     db = news.connect()
@@ -235,7 +245,8 @@ def test_write():
                                              {"article": "a3", "quote": "Dit citaat staat nergens in het stuk", "quote_en": "Made up"},
                                              {"article": "a1", "quote": "Kabinet valt", "quote_en": "Not an opinion piece"}]}]}
         else:
-            reply = {"stories": [{"key": "s1", "update": "The king accepted the resignation.", "sources": ["a1", "a9"], "quotes": []}]}
+            reply = {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "The king accepted the resignation."},
+                                                   {"article": "a9", "fact": "From an article that isn't there."}]}]}
         return json.dumps(reply), (1000, 500)
 
     news.call_mistral = fake
@@ -259,7 +270,8 @@ def test_write():
         "an update only gets the new articles"
     assert db.execute("SELECT headline, summary FROM stories WHERE id = 1").fetchone() == (
         "Dutch cabinet falls", "The cabinet fell."), "updates never rewrite the story"
-    assert db.execute("SELECT text, articles FROM updates").fetchall() == [("The king accepted the resignation.", "[5]")]
+    assert db.execute("SELECT text, articles FROM updates").fetchall() == [("The king accepted the resignation.", "[5]")], \
+        "one sentence per new article, linked to it"
 
     page = news.render(db)
     assert "The king accepted the resignation." in page and "The cabinet had no plan left" in page
@@ -267,9 +279,11 @@ def test_write():
     assert "Een column zonder nieuws" not in page
 
     add_article(db, 7, 1, "AD", "Kabinet valt, koning aanvaardt ontslag", lang="nl")
-    for reply in ({"stories": [{"key": ["s1"]}, "junk", {"key": "s1", "update": 5, "sources": [["a1"]],
+    for reply in ({"stories": [{"key": ["s1"]}, "junk", {"key": "s1", "facts": [["a1"], {"article": ["a1"], "fact": "y"},
+                                                                                   {"article": "a1", "fact": 5}],
                                                           "quotes": [{"article": {}}]}]},
-                  {"stories": None}, {"stories": 3}, [], {"stories": [{"key": "s1", "update": "x", "sources": 2}]}):
+                  {"stories": None}, {"stories": 3}, [], {"stories": [{"key": "s1", "facts": 2}]},
+                  {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "x"}]}]}):
         news.call_mistral = lambda *_: (json.dumps(reply), (10, 10))
         db.execute("UPDATE articles SET written = 0 WHERE id = 7")
         news.write(db)  # malformed replies are skipped, never fatal
@@ -292,5 +306,6 @@ test_collect_deadline()
 test_group()
 test_translate_before_grouping()
 test_language_backfill()
+test_mistral_articles()
 test_write()
 print("ok")

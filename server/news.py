@@ -402,14 +402,12 @@ Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "re
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}"""
 
 UPDATE_PROMPT = """You keep a running story in a private news app up to date. You get its current text (headline,
-summary, earlier updates) and new articles. If the new articles state something the current text doesn't have yet
-(a new number, a reaction, a statement, a next step, a correction), write an update with exactly that: 1 to 3
-sentences, at most 60 words. Every fact in the update must be in a new article's title or text; an article that is only
-a headline adds at most what its headline says. Never repeat or rewrite the current text. If new reporting contradicts
-it, say so: "Earlier reports said X; outlets now report Y." If the new articles state nothing new, the update is null.
-List the keys of the articles the update is based on.
+summary, earlier updates) and new articles. For each new article that states something the current text doesn't have
+yet, write one English sentence with only what that article itself says, from its own title and text: nothing from
+the current text or the other articles, and no day, date, number or name the article doesn't give. Skip articles that
+add nothing new; most stories need one or two sentences, some none.
 """ + RULES + """
-Return JSON: {"stories": [{"key": "s1", "update": "..." or null, "sources": ["a1"],
+Return JSON: {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "..."}],
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}"""
 
 QUOTE_MARKS = str.maketrans({c: "'" for c in "‘’‚‛"} | {c: '"' for c in "“”„‟«»"})
@@ -444,16 +442,25 @@ def batches(stories, max_stories, max_articles):
 
 
 def mistral_articles(rows):
-    """Articles as Mistral gets them: a word-for-word copy in a sister paper goes in once, its outlet under also_in."""
-    kept = {}
+    """Articles as Mistral gets them. A word-for-word copy in a sister paper (same headline, same or no teaser) goes in
+    once, with the longest teaser and its outlet under also_in; ids holds every copy."""
+    kept, seen = [], []
     for story, aid, outlet, published, opinion, title, summary, written, title_en, *_ in rows:
-        a = kept.setdefault(" ".join(title.casefold().split()), dict(
-            id=aid, outlet=outlet, opinion=bool(opinion), title=title, text=summary[:500],
-            published=datetime.fromisoformat(published).astimezone().strftime("%a %d %b %Y %H:%M"))
-            | ({"english_title": title_en} if title_en else {}))
-        if a["id"] != aid and outlet != a["outlet"] and outlet not in a.get("also_in", []):
-            a.setdefault("also_in", []).append(outlet)
-    return list(kept.values())
+        title_key, text_key = normalized(title), normalized(summary[:200])
+        match = next((a for a, (t, x) in zip(kept, seen) if t == title_key and (not x or not text_key or x == text_key)), None)
+        if match:
+            match["ids"].append(aid)
+            if outlet != match["outlet"] and outlet not in match.setdefault("also_in", []):
+                match["also_in"].append(outlet)
+            if len(summary) > len(match["text"]):
+                match["text"] = summary[:500]
+                seen[kept.index(match)] = (title_key, text_key)
+            continue
+        kept.append(dict(id=aid, ids=[aid], outlet=outlet, opinion=bool(opinion), title=title, text=summary[:500],
+                         published=datetime.fromisoformat(published).astimezone().strftime("%a %d %b %Y %H:%M"))
+                    | ({"english_title": title_en} if title_en else {}))
+        seen.append((title_key, text_key))
+    return kept
 
 
 def write(db):
@@ -501,7 +508,8 @@ def write(db):
                     articles[f"a{n}"] = a
                 keyed[f"s{i}"] = (st, articles)
                 stories.append({"key": f"s{i}", "source_count": st["sources"],
-                                "articles": [{"key": k} | {f: v for f, v in a.items() if f != "id"} for k, a in articles.items()]}
+                                "articles": [{"key": k} | {f: v for f, v in a.items() if f not in ("id", "ids")}
+                                             for k, a in articles.items()]}
                                | ({"current": st["current"]} if "current" in st else {}))
             try:
                 result = ask(db, WRITER, prompt, {"stories": stories}, 4000)
@@ -519,13 +527,16 @@ def write(db):
                         db.execute("UPDATE stories SET headline = ?, summary = ?, region = ?, summary_articles = ? WHERE id = ?",
                                    (headline, summary, region, json.dumps(st["ids"]), st["id"]))
                         written += 1
-                    elif isinstance(item.get("update"), str) and item["update"].strip():
-                        cited = item.get("sources") if isinstance(item.get("sources"), list) else []
-                        used = [articles[k]["id"] for k in cited if isinstance(k, str) and k in articles]
-                        db.execute("INSERT INTO updates(story, at, text, articles) VALUES (?,?,?,?)",
-                                   (st["id"], iso(now()), item["update"].strip(),
-                                    json.dumps(used or [a["id"] for a in articles.values()])))
-                        updated += 1
+                    else:
+                        # One sentence per new article, each linked to that article (and its word-for-word copies).
+                        facts = item.get("facts") if isinstance(item.get("facts"), list) else []
+                        for fact in facts:
+                            key = fact.get("article") if isinstance(fact, dict) else None
+                            text = fact.get("fact") if isinstance(fact, dict) else None
+                            if isinstance(key, str) and key in articles and isinstance(text, str) and text.strip():
+                                db.execute("INSERT INTO updates(story, at, text, articles) VALUES (?,?,?,?)",
+                                           (st["id"], iso(now()), text.strip(), json.dumps(articles[key]["ids"])))
+                                updated += 1
                     save_quotes(db, st["id"], item.get("quotes"), articles)
                     db.executemany("UPDATE articles SET written = 1 WHERE id = ?", [(i,) for i in st["ids"]])
                 db.commit()
@@ -598,7 +609,9 @@ def story_html(s):
         items += f'<li><details><summary>{len(arts) - 5} more</summary><ul>{more}</ul></details></li>'
     body = f'<h2>{esc(s["headline"] or arts[0][3])}</h2>'
     if s["summary"]:
-        body += f'<p class="summary">{esc(s["summary"])}</p><p class="from">{sources_line(s["summary_articles"], by_id)}</p>'
+        body += f'<p class="summary">{esc(s["summary"])}</p>'
+        if line := sources_line(s["summary_articles"], by_id):
+            body += f'<p class="from">{line}</p>'
     if s["updates"]:
         body += '<ul class="updates">' + "".join(
             f'<li><time>{when(at)}</time> {esc(text)} <span class="from">{sources_line(ids, by_id)}</span></li>'
