@@ -894,11 +894,14 @@ class Page(BaseHTTPRequestHandler):
             return self.send_error(404)
         with closing(connect()) as db:
             body = (HEAD + render(db)).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the browser stopped loading the page
 
 
 def run():
