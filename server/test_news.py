@@ -5,6 +5,7 @@ import os
 os.environ["NEWS_DB"] = ":memory:"
 
 import gzip
+import io
 import json
 import tempfile
 import threading
@@ -465,6 +466,63 @@ def test_tag():
     del os.environ["MISTRAL_API_KEY"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
 
 
+def test_morning():
+    originals = news.now, news.market, news.call_mistral
+    fixed = datetime(2026, 9, 23, 3, 30, tzinfo=UTC)
+    news.now = lambda: fixed
+    news.market = lambda: {"name": "S&P 500", "close": 6000.0, "change": -0.5, "date": "2026-09-22"}
+    db = news.connect()
+    t = news.iso(fixed)
+    for sid, region, interests, outlets in ((1, "NL", [], ["NOS", "AD", "Trouw", "NRC", "RTL Nieuws", "NU.nl"]),
+                                             (2, "NL", ["Football"], ["NOS", "AD"]),
+                                             (3, "Zwolle", [], ["De Stentor", "1Zwolle"]),
+                                             (4, "US", ["AI"], ["CNN", "Fox News", "NPR"]),
+                                             (5, "Global", [], [f"Outlet {i}" for i in range(12)])):
+        db.execute("INSERT INTO stories(id, updated, n, headline, summary, region, interests) VALUES (?,?,?,?,?,?,?)",
+                   (sid, t, len(outlets), f"Headline {sid}", f"Story number {sid} happened today. Then more.", region,
+                    json.dumps(interests)))
+        age = timedelta(hours=30 if sid == 5 else 1)
+        for i, outlet in enumerate(outlets):
+            add_article(db, sid * 100 + i, sid, outlet, f"Title {sid} {i}", age=age)
+    news.morning(db, datetime(2026, 9, 23, 4, 50, tzinfo=UTC).astimezone() - timedelta(hours=2))
+    assert db.execute("SELECT COUNT(*) FROM reports").fetchone() == (0,), "no report before REPORT_HOUR"
+    news.morning(db, fixed.astimezone())
+    report = news.latest_report(db)
+    assert report["day"] == "2026-09-23" and report["market"]["change"] == -0.5
+    assert [(sec["title"], [st["id"] for st in sec["stories"]]) for sec in report["sections"]] == [
+        ("Zwolle", [3]), ("NL", [1]), ("AI", [4]), ("Football", [2])], \
+        "major stories per region, then interests; old news and small stories stay out"
+    assert report["sections"][1]["stories"][0] == {"id": 1, "headline": "Headline 1", "gist": "Story number 1 happened today.",
+                                                  "sources": 6}, "without a writer the gist is the summary's first sentence"
+    news.morning(db, fixed.astimezone())
+    assert db.execute("SELECT COUNT(*) FROM reports").fetchone() == (1,), "one report a day"
+    assert news.api(db)["report"] == report
+
+    os.environ["MISTRAL_API_KEY"] = "test"
+    news.call_mistral = lambda *_: (json.dumps({"stories": [{"key": "s2", "gist": "The cabinet fell."},
+                                                            {"key": "s3", "gist": ""}]}), (10, 10))
+    db.execute("DELETE FROM reports")
+    news.morning(db, fixed.astimezone())
+    gist = {st["id"]: st["gist"] for sec in news.latest_report(db)["sections"] for st in sec["stories"]}
+    assert gist[1] == "The cabinet fell." and gist[4] == "Story number 4 happened today.", "empty gists fall back"
+    del os.environ["MISTRAL_API_KEY"]
+    news.now, news.market, news.call_mistral = originals
+
+    local = datetime(2026, 9, 23, 5, 20).astimezone()
+    assert news.group_slot(local).hour == 5
+    assert news.group_slot(local.replace(hour=4, minute=59)).hour == 2
+    assert news.group_slot(local.replace(hour=1)) == local.replace(hour=23, minute=0) - timedelta(days=1)
+
+    urlopen = news.urllib.request.urlopen
+    chart = {"chart": {"result": [{"meta": {"regularMarketPrice": 6030.0, "chartPreviousClose": 6000.0,
+                                            "regularMarketTime": 1790193600, "gmtoffset": -14400}}]}}
+    news.urllib.request.urlopen = lambda *a, **k: io.BytesIO(json.dumps(chart).encode())
+    assert news.market() == {"name": "S&P 500", "close": 6030.0, "change": 0.5, "date": "2026-09-23"}
+    news.urllib.request.urlopen = lambda *a, **k: io.BytesIO(b"<html>")
+    assert news.market() is None
+    news.urllib.request.urlopen = urlopen
+
+
 def test_http():
     server = news.ThreadingHTTPServer(("127.0.0.1", 0), news.Page)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -472,6 +530,8 @@ def test_http():
     with urllib.request.urlopen(urllib.request.Request(base + "/api/stories", headers={"Accept-Encoding": "gzip"})) as r:
         assert r.headers["Content-Encoding"] == "gzip" and r.headers["Content-Type"] == "application/json"
         assert json.loads(gzip.decompress(r.read()))["stories"] == []
+    with urllib.request.urlopen(base + "/api/report") as r:
+        assert r.read() == b"null"
     with urllib.request.urlopen(base + "/") as r:
         assert r.headers["Content-Encoding"] is None and r.read().startswith(b"<!doctype html>")
     try:
@@ -495,5 +555,6 @@ test_mistral_articles()
 test_write()
 test_claude_writer()
 test_tag()
+test_morning()
 test_http()
 print("ok")

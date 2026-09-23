@@ -37,7 +37,14 @@ THRESHOLD = float(os.environ.get("NEWS_THRESHOLD", "0.6"))
 MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 COLLECT_EVERY = 30 * 60
 COLLECT_WITHIN = 120  # seconds for all feeds together
-GROUP_EVERY = 3 * 3600
+# Grouping and writing run every 3 hours at fixed local times, one of them at REPORT_HOUR; the morning report is built
+# right after that run, and the app notifies at 05:30.
+REPORT_HOUR = 5
+# A story is major for its region's part of the morning report with at least this many independent sources.
+MAJOR = {"Zwolle": 2, "Overijssel": 2, "NL": 5, "EU": 6, "US": 8, "Global": 10}
+REPORT_PER_REGION = 5
+REPORT_PER_INTEREST = 3
+SP500 = "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=1d&interval=1d"
 # A story accepts articles published up to this long after its latest one; older feed items are skipped.
 OPEN_FOR = timedelta(hours=72)
 SHOW = timedelta(hours=48)
@@ -85,6 +92,7 @@ CREATE TABLE IF NOT EXISTS sources(url TEXT PRIMARY KEY, name TEXT, checked TEXT
 CREATE TABLE IF NOT EXISTS updates(id INTEGER PRIMARY KEY, story INTEGER, at TEXT, text TEXT, articles TEXT);
 CREATE TABLE IF NOT EXISTS quotes(id INTEGER PRIMARY KEY, story INTEGER, article INTEGER, quote TEXT, quote_en TEXT);
 CREATE TABLE IF NOT EXISTS spend(day TEXT PRIMARY KEY, usd REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS reports(day TEXT PRIMARY KEY, body TEXT);
 """
 # Columns added after the first release; connect() adds them to older databases.
 COLUMNS = {"articles": ["lang TEXT", "title_en TEXT", "summary_en TEXT", "written INTEGER DEFAULT 0"],
@@ -500,6 +508,12 @@ about it, not when it comes up in passing. Include every story, with an empty li
 stories by their key exactly as given ("s1").
 Return JSON: {"stories": [{"key": "s1", "interests": ["AI", "Tech"]}]}"""
 
+REPORT_PROMPT = """You write the morning report of a private news app. For each story write one plain English sentence of at
+most 25 words that says what happened, including the latest update if there is one. Use only the given headline,
+summary and updates: no new facts, no opinions, no loaded words. The headline is shown above your sentence, so don't
+repeat it. Refer to stories by their key exactly as given ("s1").
+Return JSON: {"stories": [{"key": "s1", "gist": "..."}]}"""
+
 QUOTES_SCHEMA = {"type": "array", "items": {"type": "object", "required": ["article", "quote", "quote_en"],
                                              "properties": {"article": {"type": "string"}, "quote": {"type": "string"},
                                                             "quote_en": {"type": "string"}}}}
@@ -513,6 +527,9 @@ SCHEMAS = {
         "properties": {"key": {"type": "string"}, "quotes": QUOTES_SCHEMA, "facts": {"type": "array", "items": {
             "type": "object", "required": ["article", "fact"],
             "properties": {"article": {"type": "string"}, "fact": {"type": "string"}}}}}}}}},
+    REPORT_PROMPT: {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
+        "type": "object", "required": ["key", "gist"],
+        "properties": {"key": {"type": "string"}, "gist": {"type": "string"}}}}}},
     TAG_PROMPT: {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
         "type": "object", "required": ["key", "interests"],
         "properties": {"key": {"type": "string"}, "interests": {"type": "array", "items": {"enum": list(INTERESTS)}}}}}}},
@@ -720,6 +737,76 @@ def tag(db):
             print(f"tag: stopped until the next run ({type(e).__name__}: {e})", flush=True)
             break
     print(f"tag: {tagged} stories have an interest", flush=True)
+
+
+def market():
+    """The S&P 500's last close and its change from the close before, or None when Yahoo doesn't answer."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(SP500, headers={"User-Agent": UA}), timeout=20) as response:
+            meta = json.load(response)["chart"]["result"][0]["meta"]
+        close, before = float(meta["regularMarketPrice"]), float(meta["chartPreviousClose"])
+        new_york = timezone(timedelta(seconds=meta["gmtoffset"]))
+        return {"name": "S&P 500", "close": round(close, 2), "change": round((close / before - 1) * 100, 2),
+                "date": datetime.fromtimestamp(meta["regularMarketTime"], new_york).date().isoformat()}
+    except (OSError, ValueError, KeyError, IndexError, TypeError, ZeroDivisionError) as e:
+        print(f"report: no S&P 500 close ({type(e).__name__}: {e})", flush=True)
+        return None
+
+
+def gists(db, stories):
+    """One sentence per story for the report, from Claude or Mistral; the summary's first sentence when neither answers."""
+    first = {s["id"]: (re.match(r".{20,}?[.!?](?=\s|$)", s["summary"]) or [s["summary"]])[0] for s in stories}
+    keyed = {f"s{i}": s["id"] for i, s in enumerate(stories, 1)}
+    payload = {"stories": [{"key": f"s{i}", "headline": s["headline"], "summary": s["summary"],
+                            "updates": [text for _, text, _ in s["updates"]]} for i, s in enumerate(stories, 1)]}
+    for writer in available_writers() if stories else []:
+        try:
+            result = ask(db, writer, REPORT_PROMPT, payload, 4000)
+            items = result.get("stories") if isinstance(result, dict) else None
+            for item in items if isinstance(items, list) else []:
+                key, gist = (item.get("key"), item.get("gist")) if isinstance(item, dict) else (None, None)
+                if isinstance(key, str) and key in keyed and isinstance(gist, str) and 0 < len(gist.split()) <= 40:
+                    first[keyed[key]] = gist.strip()
+            break
+        except (ClaudeUnavailable, OverBudget, ValueError, TypeError, KeyError, AttributeError, OSError,
+                http.client.HTTPException) as e:
+            print(f"report: {writer} wrote no gists ({type(e).__name__}: {e})", flush=True)
+    return first
+
+
+def morning(db, t=None):
+    """Builds the day's morning report once the REPORT_HOUR run is done: the S&P 500's last close, the major stories of
+    the last 24 hours per region, and the top stories per interest."""
+    t = t or datetime.now().astimezone()
+    end = t.replace(hour=REPORT_HOUR, minute=0, second=0, microsecond=0)
+    day = end.date().isoformat()
+    if t < end or db.execute("SELECT 1 FROM reports WHERE day = ?", (day,)).fetchone():
+        return
+    since = iso(end - timedelta(days=1))
+    stories = [s for s in shown(db) if s["headline"] and any(a[5] >= since for a in s["arts"])]
+    sections, picked = [], set()
+    for region in REGIONS:
+        major = [s for s in stories if region in s["regions"] and s["sources"] >= MAJOR[region]][:REPORT_PER_REGION]
+        sections.append((region, major))
+        picked |= {s["id"] for s in major}
+    for interest in INTERESTS:
+        top = [s for s in stories if interest in s["interests"] and s["id"] not in picked][:REPORT_PER_INTEREST]
+        sections.append((interest, top))
+        picked |= {s["id"] for s in top}
+    listed = [s for _, section in sections for s in section]
+    gist = gists(db, listed)
+    body = {"day": day, "built": iso(now()), "since": since, "market": market(),
+            "sections": [{"title": title, "stories": [{"id": s["id"], "headline": s["headline"], "gist": gist[s["id"]],
+                                                       "sources": s["sources"]} for s in section]}
+                         for title, section in sections if section]}
+    db.execute("INSERT OR REPLACE INTO reports(day, body) VALUES (?, ?)", (day, json.dumps(body)))
+    db.commit()
+    print(f"report: {len(listed)} stories for {day}", flush=True)
+
+
+def latest_report(db):
+    row = db.execute("SELECT body FROM reports ORDER BY day DESC LIMIT 1").fetchone()
+    return json.loads(row[0]) if row else None
 
 
 def esc(s):
@@ -1012,7 +1099,8 @@ def api(db):
                           "lean": lean.get(outlet_key(a[1]))} for a in arts]})
     feeds = [{"name": name, "url": url, "items": items, "error": error, "checked": checked} for name, url, items, error, checked
              in db.execute("SELECT name, url, items, error, checked FROM sources ORDER BY error IS NULL, name")]
-    return {"built": iso(now()), "tabs": REGIONS + list(INTERESTS), "stories": stories, "feeds": feeds}
+    return {"built": iso(now()), "tabs": REGIONS + list(INTERESTS), "stories": stories, "feeds": feeds,
+            "report": latest_report(db)}
 
 
 HEAD = '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">'
@@ -1021,13 +1109,14 @@ HEAD = '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewpor
 class Page(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
-        if path not in ("/", "/api/stories"):
+        if path not in ("/", "/api/stories", "/api/report"):
             return self.send_error(404)
         with closing(connect()) as db:
             if path == "/":
                 body, kind = (HEAD + render(db)).encode(), "text/html; charset=utf-8"
             else:
-                body, kind = json.dumps(api(db), ensure_ascii=False).encode(), "application/json"
+                data = api(db) if path == "/api/stories" else latest_report(db)
+                body, kind = json.dumps(data, ensure_ascii=False).encode(), "application/json"
         packed = "gzip" in self.headers.get("Accept-Encoding", "")
         if packed:
             body = gzip.compress(body)
@@ -1043,6 +1132,11 @@ class Page(BaseHTTPRequestHandler):
             pass  # the browser stopped loading the page
 
 
+def group_slot(t):
+    """The latest processing time at or before t: every 3 hours on the hour, one of them at REPORT_HOUR."""
+    return t.replace(minute=0, second=0, microsecond=0) - timedelta(hours=(t.hour - REPORT_HOUR) % 3)
+
+
 def run():
     # As the container's first process, Python would otherwise ignore the stop signal.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
@@ -1053,14 +1147,16 @@ def run():
         try:
             with closing(connect()) as db:
                 collect(db)
-                if grouped is None or time.monotonic() - grouped >= GROUP_EVERY:
+                started = datetime.now().astimezone()
+                if grouped is None or grouped < group_slot(started):
                     group(db)
-                    grouped = time.monotonic()
+                    grouped = started
                     write(db)
                     tag(db)
+                morning(db)
         except Exception:
             traceback.print_exc()
-        time.sleep(COLLECT_EVERY)
+        time.sleep(COLLECT_EVERY - time.time() % COLLECT_EVERY)  # on the hour and half hour
 
 
 if __name__ == "__main__":
@@ -1073,4 +1169,4 @@ if __name__ == "__main__":
                 print(render(db))
             else:
                 {"collect": collect, "group": group, "regroup": regroup, "translate": translate, "write": write,
-                 "tag": tag}[command](db)
+                 "tag": tag, "morning": morning}[command](db)
