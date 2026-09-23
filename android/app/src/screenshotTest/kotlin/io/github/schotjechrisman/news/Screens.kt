@@ -87,7 +87,8 @@ private val news = News(
 fun StoriesPreview() {
     NewsTheme {
         StoriesScreen(news, loading = false, error = null, tab = "All", listState = LazyListState(),
-            onTab = {}, onRefresh = {}, onOpen = {}, onReport = {}, onSearch = {}, onFeeds = {}, onServer = {})
+            onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onServer = {},
+            bottomBar = { NavBar(Screen.Stories) {} })
     }
 }
 
@@ -98,7 +99,8 @@ fun StoriesPreview() {
 fun StoriesOfflinePreview() {
     NewsTheme {
         StoriesScreen(news, loading = false, error = "Can't find http://newsbox:8080. Is Tailscale on?", tab = "Zwolle",
-            listState = LazyListState(), onTab = {}, onRefresh = {}, onOpen = {}, onReport = {}, onSearch = {}, onFeeds = {}, onServer = {})
+            listState = LazyListState(), onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onServer = {},
+            bottomBar = { NavBar(Screen.Stories) {} })
     }
 }
 
@@ -115,7 +117,7 @@ fun StoryPreview() {
 @Preview(name = "dark", widthDp = 400, heightDp = 860, uiMode = UI_MODE_NIGHT_YES)
 @Composable
 fun ReportPreview() {
-    NewsTheme { ReportScreen(report, onOpen = {}, onBack = {}) }
+    NewsTheme { ReportScreen(report, onOpen = {}, bottomBar = { NavBar(Screen.Report) {} }) }
 }
 
 @PreviewTest
@@ -125,7 +127,7 @@ fun ReportPreview() {
 fun SearchPreview() {
     NewsTheme {
         SearchScreen("pec zwolle", onQuery = {}, onSearch = {}, results = stories.drop(2), searching = false, error = null,
-            onOpen = {}, onBack = {})
+            onOpen = {}, bottomBar = { NavBar(Screen.Search) {} })
     }
 }
 

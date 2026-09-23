@@ -164,6 +164,7 @@ fun App(state: NewsState) {
     // One scroll position per tab, kept while a story is open.
     val lists = remember { mutableMapOf<String, LazyListState>() }
     val news = state.news
+    val navBar = @Composable { NavBar(screen) { screen = it } }
 
     BackHandler(enabled = screen != Screen.Stories && state.server.isNotBlank()) {
         screen = if (screen == Screen.Story) storyFrom else Screen.Stories
@@ -189,10 +190,9 @@ fun App(state: NewsState) {
             onTab = { tab = it },
             onRefresh = { scope.launch { state.refresh() } },
             onOpen = { storyId = it.id; storyFrom = Screen.Stories; screen = Screen.Story },
-            onReport = { screen = Screen.Report },
-            onSearch = { screen = Screen.Search },
             onFeeds = { screen = Screen.Feeds },
             onServer = { screen = Screen.Server },
+            bottomBar = navBar,
         )
         Screen.Story -> {
             val story = news?.stories?.find { it.id == storyId } ?: state.results?.find { it.id == storyId }
@@ -202,7 +202,7 @@ fun App(state: NewsState) {
         Screen.Report -> ReportScreen(
             report = news?.report,
             onOpen = { storyId = it; storyFrom = Screen.Report; screen = Screen.Story },
-            onBack = { screen = Screen.Stories },
+            bottomBar = navBar,
         )
         Screen.Search -> SearchScreen(
             query = query,
@@ -212,7 +212,7 @@ fun App(state: NewsState) {
             searching = state.searching,
             error = state.searchError,
             onOpen = { storyId = it.id; storyFrom = Screen.Search; screen = Screen.Story },
-            onBack = { screen = Screen.Stories },
+            bottomBar = navBar,
         )
         Screen.Feeds -> FeedsScreen(news?.feeds.orEmpty(), onBack = { screen = Screen.Stories })
         Screen.Server -> ServerScreen(
