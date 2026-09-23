@@ -4,9 +4,14 @@ import os
 
 os.environ["NEWS_DB"] = ":memory:"
 
+import gzip
 import json
 import tempfile
+import threading
 import time
+import tomllib
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -67,6 +72,10 @@ def test_sources():
     sources, names, _ = news.load_sources()
     for source in sources:
         assert names[news.outlet_key(source["name"])] == source["name"], f"{source['name']} collides with another name"
+    rated = [name for group in tomllib.loads(SOURCES.read_text())["lean"].values() for name in group]
+    assert len(news.leans()) == len(rated), "each outlet has one lean"
+    assert set(news.leans()) <= set(names), "every rated outlet is one of the sources"
+    assert {s["region"] for s in sources} == set(news.REGIONS) | {None}
 
 
 def test_source_count():
@@ -279,6 +288,19 @@ def test_write():
     assert page.count(">Tubantia</a>") == 1, "the summary names the sources it was written from"
     assert "Een column zonder nieuws" not in page
 
+    data = news.api(db)
+    assert [s["id"] for s in data["stories"]] == [1], "the app gets the stories the page shows"
+    [story] = data["stories"]
+    assert (story["headline"], story["summary"], story["tabs"], story["sources"]) == ("Dutch cabinet falls", "The cabinet fell.", ["NL"], 3)
+    assert story["lean"] == {"left": 1, "center": 1, "right": 0}, "Trouw and NOS; the Tubantia copy counts once"
+    assert story["updates"] == [{"at": story["updates"][0]["at"], "text": "The king accepted the resignation.",
+                                 "from": [{"outlet": "NOS", "url": "https://x.nl/5"}]}]
+    assert story["quotes"] == [{"text": "The cabinet had no plan left", "outlet": "Trouw", "url": "https://x.nl/3", "translated": True}]
+    assert [a["outlet"] for a in story["summary_from"]] == ["NOS", "BBC", "Trouw", "Tubantia"]
+    assert [(a["outlet"], a["lean"], a["opinion"]) for a in story["articles"][:3]] == [
+        ("NOS", "center", False), ("BBC", None, False), ("Trouw", "left", True)]
+    assert data["tabs"] == news.REGIONS
+
     add_article(db, 7, 1, "AD", "Kabinet valt, koning aanvaardt ontslag", lang="nl")
     for reply in ({"stories": [{"key": ["s1"]}, "junk", {"key": "s1", "facts": [["a1"], {"article": ["a1"], "fact": "y"},
                                                                                    {"article": "a1", "fact": 5}],
@@ -394,6 +416,23 @@ def test_claude_writer():
     del os.environ["MISTRAL_API_KEY"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
 
 
+def test_http():
+    server = news.ThreadingHTTPServer(("127.0.0.1", 0), news.Page)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    with urllib.request.urlopen(urllib.request.Request(base + "/api/stories", headers={"Accept-Encoding": "gzip"})) as r:
+        assert r.headers["Content-Encoding"] == "gzip" and r.headers["Content-Type"] == "application/json"
+        assert json.loads(gzip.decompress(r.read()))["stories"] == []
+    with urllib.request.urlopen(base + "/") as r:
+        assert r.headers["Content-Encoding"] is None and r.read().startswith(b"<!doctype html>")
+    try:
+        urllib.request.urlopen(base + "/api/nothing")
+        raise AssertionError("unknown paths are not found")
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+    server.shutdown()
+
+
 test_parse()
 test_outlet_key()
 test_sources()
@@ -406,4 +445,5 @@ test_language_backfill()
 test_mistral_articles()
 test_write()
 test_claude_writer()
+test_http()
 print("ok")
