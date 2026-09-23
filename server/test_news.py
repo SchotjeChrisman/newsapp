@@ -4,6 +4,7 @@ import os
 
 os.environ["NEWS_DB"] = ":memory:"
 
+import json
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -68,13 +69,10 @@ def test_sources():
 
 
 def test_source_count():
-    def a(outlet, title):
-        return (1, outlet, None, title, "", "", 0)
-
-    story = [a("AD", "Brand in Zwolle"), a("Tubantia", "Brand in  zwolle"), a("De Stentor", "Brand in Zwolle"),
-             a("NOS", "Grote brand in Zwolle"), a("NOS", "Brand in Zwolle geblust")]
+    story = [("AD", "Brand in Zwolle"), ("Tubantia", "Brand in  zwolle"), ("De Stentor", "Brand in Zwolle"),
+             ("NOS", "Grote brand in Zwolle"), ("NOS", "Brand in Zwolle geblust")]
     assert news.source_count(story) == 2, "identical headlines from sister papers count once"
-    chained = [a("AD", "X"), a("Tubantia", "X"), a("AD", "Y"), a("De Stentor", "Y"), a("NOS", "Z")]
+    chained = [("AD", "X"), ("Tubantia", "X"), ("AD", "Y"), ("De Stentor", "Y"), ("NOS", "Z")]
     assert news.source_count(chained) == 2
 
 
@@ -172,6 +170,86 @@ def test_group():
     assert "<script>alert(1)" not in page and "&lt;script&gt;alert(1)" in page
 
 
+def add_article(db, aid, story, outlet, title, opinion=0, lang="en", summary="", age=timedelta(hours=1)):
+    db.execute("INSERT INTO articles(id, url, outlet, region, title, summary, published, opinion, lang, story)"
+               " VALUES (?,?,?,?,?,?,?,?,?,?)",
+               (aid, f"https://x.nl/{aid}", outlet, "NL", title, summary, news.iso(news.now() - age), opinion, lang, story))
+
+
+def test_translate_before_grouping():
+    os.environ["MISTRAL_API_KEY"] = "test"
+    db = news.connect()
+    add_article(db, 1, None, "NOS", "Kabinet valt", lang="nl", summary="Het kabinet is gevallen.")
+    add_article(db, 2, None, "BBC", "Dutch cabinet falls", summary="The Dutch cabinet has fallen.")
+
+    def fake(model, system, payload, max_tokens):
+        assert model == news.TRANSLATOR and [i["id"] for i in payload["items"]] == [1], "only Dutch articles"
+        return json.dumps({"items": [{"id": 1, "title": "Cabinet falls", "text": "The cabinet has fallen."}]}), (100, 50)
+
+    embedded = []
+    news.call_mistral = fake
+    news.embed = lambda texts: embedded.extend(texts) or np.array([[1, 0, 0]] * len(texts), np.float32)
+    news.group(db)
+    assert db.execute("SELECT title_en FROM articles WHERE id = 1").fetchone() == ("Cabinet falls",)
+    assert sorted(embedded) == ["Cabinet falls. The cabinet has fallen.", "Dutch cabinet falls. The Dutch cabinet has fallen."]
+    del os.environ["MISTRAL_API_KEY"]
+
+
+def test_write():
+    os.environ["MISTRAL_API_KEY"] = "test"
+    db = news.connect()
+    db.execute("INSERT INTO stories(id, updated, n) VALUES (1, ?, 3), (2, ?, 1)", (news.iso(news.now()),) * 2)
+    add_article(db, 1, 1, "NOS", "Kabinet valt", lang="nl")
+    add_article(db, 2, 1, "BBC", "Dutch cabinet falls")
+    add_article(db, 3, 1, "Trouw", "Waarom dit kabinet moest vallen", opinion=1, lang="nl",
+                summary="Het kabinet had geen plan meer voor de asielcrisis.")
+    add_article(db, 4, 2, "Trouw", "Een column zonder nieuws", opinion=1, lang="nl")
+    calls = []
+
+    def fake(model, system, payload, max_tokens):
+        calls.append((system, payload))
+        if system is news.NEW_PROMPT:
+            reply = {"stories": [{"key": "s1", "headline": "Dutch cabinet falls", "summary": "The cabinet fell.", "region": "NL",
+                                  "quotes": [{"article": "a3", "quote": "“Het kabinet had geen plan meer”",
+                                              "quote_en": "The cabinet had no plan left"},
+                                             {"article": "a3", "quote": "Dit citaat staat nergens in het stuk", "quote_en": "Made up"},
+                                             {"article": "a1", "quote": "Kabinet valt", "quote_en": "Not an opinion piece"}]}]}
+        else:
+            reply = {"stories": [{"key": "s1", "update": "The king accepted the resignation.", "sources": ["a1", "a9"], "quotes": []}]}
+        return json.dumps(reply), (1000, 500)
+
+    news.call_mistral = fake
+    news.write(db)
+    assert [[a["title"] for a in st["articles"]] for _, p in calls for st in p["stories"]] == [
+        ["Kabinet valt", "Dutch cabinet falls", "Waarom dit kabinet moest vallen"]], "a lone opinion column waits for more coverage"
+    assert db.execute("SELECT headline, summary, region FROM stories WHERE id = 1").fetchone() == (
+        "Dutch cabinet falls", "The cabinet fell.", "NL")
+    assert db.execute("SELECT quote_en FROM quotes").fetchall() == [("The cabinet had no plan left",)], \
+        "only word-for-word quotes from opinion articles"
+    assert db.execute("SELECT id FROM articles WHERE written = 1 ORDER BY id").fetchall() == [(1,), (2,), (3,)]
+    assert abs(db.execute("SELECT usd FROM spend").fetchone()[0] - (1000 * 0.15 + 500 * 0.6) / 1e6) < 1e-12
+
+    add_article(db, 5, 1, "NOS", "Koning aanvaardt ontslag", lang="nl")
+    news.write(db)
+    assert calls[-1][0] is news.UPDATE_PROMPT
+    assert [a["title"] for a in calls[-1][1]["stories"][0]["articles"]] == ["Koning aanvaardt ontslag"], \
+        "an update only gets the new articles"
+    assert db.execute("SELECT headline, summary FROM stories WHERE id = 1").fetchone() == (
+        "Dutch cabinet falls", "The cabinet fell."), "updates never rewrite the story"
+    assert db.execute("SELECT text, articles FROM updates").fetchall() == [("The king accepted the resignation.", "[5]")]
+
+    page = news.render(db)
+    assert "The king accepted the resignation." in page and "The cabinet had no plan left" in page
+    assert "Een column zonder nieuws" not in page
+
+    db.execute("UPDATE spend SET usd = ?", (news.DAILY_BUDGET,))
+    add_article(db, 6, 1, "BBC", "King accepts resignation")
+    requests = len(calls)
+    news.write(db)
+    assert len(calls) == requests, "no requests once the daily budget is spent"
+    del os.environ["MISTRAL_API_KEY"]
+
+
 test_parse()
 test_outlet_key()
 test_sources()
@@ -179,4 +257,6 @@ test_source_count()
 test_collect()
 test_collect_deadline()
 test_group()
+test_translate_before_grouping()
+test_write()
 print("ok")

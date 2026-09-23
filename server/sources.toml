@@ -1,5 +1,6 @@
 # One array per region tab. Topics holds outlets that belong to no region (tech, markets, science, football, music).
 # opinion = true marks a feed that only carries opinion pieces and columns.
+# lang: sources in Zwolle, Overijssel and NL are Dutch, all others English, unless lang says otherwise.
 # Google News feeds bring in many outlets at once; each article is credited to its real outlet.
 # Outlet names are matched loosely ("telegraaf.nl" is "De Telegraaf"); the [aliases] table at the end covers names that differ more.
 
@@ -58,8 +59,8 @@ NL = [
   { name = "EenVandaag", url = "https://eenvandaag.avrotros.nl/feed/" },
   { name = "Rijksoverheid", url = "https://news.google.com/rss/search?q=when:7d+site:rijksoverheid.nl&hl=nl&gl=NL&ceid=NL:nl" },
   { name = "Google News: NL", url = "https://news.google.com/rss?hl=nl&gl=NL&ceid=NL:nl" },
-  { name = "DutchNews.nl", url = "https://www.dutchnews.nl/feed/" },
-  { name = "NL Times", url = "https://nltimes.nl/rss" },
+  { name = "DutchNews.nl", url = "https://www.dutchnews.nl/feed/", lang = "en" },
+  { name = "NL Times", url = "https://nltimes.nl/rss", lang = "en" },
   { name = "Metro", url = "https://www.metronieuws.nl/feed/" },
 ]
 
@@ -169,7 +170,7 @@ Topics = [
   { name = "TechCrunch", url = "https://techcrunch.com/feed/" },
   { name = "Wired", url = "https://www.wired.com/feed/rss" },
   { name = "MIT Technology Review", url = "https://www.technologyreview.com/feed/" },
-  { name = "Tweakers", url = "https://tweakers.net/feeds/mixed.xml" },
+  { name = "Tweakers", url = "https://tweakers.net/feeds/mixed.xml", lang = "nl" },
   { name = "BBC News", url = "https://feeds.bbci.co.uk/news/technology/rss.xml" },
   { name = "The Guardian", url = "https://www.theguardian.com/technology/rss" },
   { name = "The New York Times", url = "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml" },
@@ -184,14 +185,14 @@ Topics = [
   { name = "BBC Sport", url = "https://feeds.bbci.co.uk/sport/football/rss.xml" },
   { name = "The Guardian", url = "https://www.theguardian.com/football/rss" },
   { name = "ESPN", url = "https://www.espn.com/espn/rss/soccer/news" },
-  { name = "Voetbal International", url = "https://www.vi.nl/rss" },
+  { name = "Voetbal International", url = "https://www.vi.nl/rss", lang = "nl" },
   { name = "Goal", url = "https://news.google.com/rss/search?q=when:2d+site:goal.com&hl=en-US&gl=US&ceid=US:en" },
   { name = "Pitchfork", url = "https://pitchfork.com/rss/news/" },
   { name = "Billboard", url = "https://www.billboard.com/feed/" },
   { name = "Rolling Stone", url = "https://www.rollingstone.com/feed/" },
   { name = "NME", url = "https://www.nme.com/feed" },
   { name = "The Guardian", url = "https://www.theguardian.com/music/rss" },
-  { name = "3voor12", url = "https://3voor12.vpro.nl/rss.xml" },
+  { name = "3voor12", url = "https://3voor12.vpro.nl/rss.xml", lang = "nl" },
   { name = "Engadget", url = "https://www.engadget.com/rss.xml" },
   { name = "The Register", url = "https://www.theregister.com/headlines.atom" },
   { name = "ZDNET", url = "https://www.zdnet.com/news/rss.xml" },
@@ -199,8 +200,8 @@ Topics = [
   { name = "Tom's Hardware", url = "https://www.tomshardware.com/feeds/all" },
   { name = "BleepingComputer", url = "https://www.bleepingcomputer.com/feed/" },
   { name = "The Decoder", url = "https://the-decoder.com/feed/" },
-  { name = "Security.nl", url = "https://www.security.nl/rss/headlines.xml" },
-  { name = "Emerce", url = "https://www.emerce.nl/feed" },
+  { name = "Security.nl", url = "https://www.security.nl/rss/headlines.xml", lang = "nl" },
+  { name = "Emerce", url = "https://www.emerce.nl/feed", lang = "nl" },
   { name = "Bloomberg", url = "https://feeds.bloomberg.com/markets/news.rss" },
   { name = "CNBC", url = "https://www.cnbc.com/id/15839069/device/rss/rss.html" },
   { name = "MarketWatch", url = "https://feeds.content.dowjones.io/public/rss/mw_topstories" },

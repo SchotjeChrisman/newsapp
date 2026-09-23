@@ -1,8 +1,10 @@
-"""Private news server: collects feeds, groups articles about the same event into stories, serves a check page."""
+"""Private news server: collects feeds, groups articles about the same event into stories,
+has Mistral write them up, and serves a check page."""
 
 import email.utils
 import fnmatch
 import html
+import json
 import os
 import re
 import signal
@@ -12,6 +14,7 @@ import threading
 import time
 import tomllib
 import traceback
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 import zlib
@@ -41,6 +44,15 @@ OPINION = re.compile(r"/(columns?-opinie|opinie|opinions?|columns?|commentisfree
 OPINION_TITLE = re.compile(r"^(opinion|opinie|column)\s*[|:]|\|\s*(opinion|opinie|column)\s*$", re.I)
 TAG = re.compile(r"<[^>]+>")
 REGIONS = ["Zwolle", "Overijssel", "NL", "EU", "US", "Global"]
+DUTCH_REGIONS = {"Zwolle", "Overijssel", "NL"}  # sources there write Dutch unless sources.toml says otherwise
+
+MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+WRITER = "mistral-small-2603"
+TRANSLATOR = "ministral-8b-2512"
+# USD per million input and output tokens (mistral.ai/pricing/api, September 2026).
+PRICES = {"mistral-small-2603": (0.15, 0.6), "ministral-14b-2512": (0.2, 0.2), "ministral-8b-2512": (0.15, 0.15)}
+# The account has a monthly limit too; this keeps one busy day from eating the month.
+DAILY_BUDGET = 0.60
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS articles(
@@ -50,7 +62,13 @@ CREATE INDEX IF NOT EXISTS articles_outlet_title ON articles(outlet, title);
 CREATE INDEX IF NOT EXISTS articles_story ON articles(story);
 CREATE TABLE IF NOT EXISTS stories(id INTEGER PRIMARY KEY, updated TEXT, n INTEGER, vec BLOB);
 CREATE TABLE IF NOT EXISTS sources(url TEXT PRIMARY KEY, name TEXT, checked TEXT, items INTEGER, error TEXT);
+CREATE TABLE IF NOT EXISTS updates(id INTEGER PRIMARY KEY, story INTEGER, at TEXT, text TEXT, articles TEXT);
+CREATE TABLE IF NOT EXISTS quotes(id INTEGER PRIMARY KEY, story INTEGER, article INTEGER, quote TEXT, quote_en TEXT);
+CREATE TABLE IF NOT EXISTS spend(day TEXT PRIMARY KEY, usd REAL);
 """
+# Columns added after the first release; connect() adds them to older databases.
+COLUMNS = {"articles": ["lang TEXT", "title_en TEXT", "summary_en TEXT", "written INTEGER DEFAULT 0"],
+           "stories": ["headline TEXT", "summary TEXT", "region TEXT"]}
 
 
 def now():
@@ -65,6 +83,11 @@ def connect(path=None):
     db = sqlite3.connect(path or DB, timeout=30)
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
+    for table, columns in COLUMNS.items():
+        have = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        for column in columns:
+            if column.split()[0] not in have:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
     return db
 
 
@@ -78,7 +101,9 @@ def load_sources():
     """sources.toml holds one array per region (Topics: outlets without a region), outlet aliases and ignored outlets."""
     data = tomllib.loads(SOURCES.read_text())
     aliases, ignore = data.pop("aliases", {}), data.pop("ignore", [])
-    sources = [s | {"region": None if region == "Topics" else region} for region, items in data.items() for s in items]
+    sources = [s | {"region": None if region == "Topics" else region,
+                    "lang": s.get("lang", "nl" if region in DUTCH_REGIONS else "en")}
+               for region, items in data.items() for s in items]
     names = {outlet_key(s["name"]): s["name"] for s in sources} | {outlet_key(a): n for a, n in aliases.items()}
     return sources, names, ignore
 
@@ -188,8 +213,9 @@ def collect(db):
             opinion = (s.get("opinion", False) or bool(OPINION.search(urlsplit(a["url"]).path))
                        or bool(OPINION_TITLE.search(a["title"])))
             new += db.execute(
-                "INSERT OR IGNORE INTO articles(url, outlet, region, title, summary, published, opinion) VALUES (?,?,?,?,?,?,?)",
-                (a["url"], outlet, s["region"], a["title"], a["summary"], iso(published), opinion)).rowcount
+                "INSERT OR IGNORE INTO articles(url, outlet, region, title, summary, published, opinion, lang)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (a["url"], outlet, s["region"], a["title"], a["summary"], iso(published), opinion, s["lang"])).rowcount
         db.execute("INSERT OR REPLACE INTO sources VALUES (?,?,?,?,?)", (s["url"], s["name"], iso(t), len(items), error))
     db.execute(f"DELETE FROM sources WHERE url NOT IN ({','.join('?' * len(sources))})", [s["url"] for s in sources])
     db.commit()
@@ -215,7 +241,13 @@ def group(db):
     # roughly 0.5 GB a year; prune old rows if the disk ever minds.
     db.execute("UPDATE articles SET vec = NULL WHERE published < ?", (iso(now() - 3 * OPEN_FOR),))
     db.execute("UPDATE stories SET vec = NULL WHERE updated < ?", (iso(now() - 3 * OPEN_FOR),))
-    todo = db.execute("SELECT id, title, summary FROM articles WHERE vec IS NULL AND story IS NULL").fetchall()
+    if os.environ.get("MISTRAL_API_KEY"):
+        try:
+            translate(db)
+        except Exception as e:  # grouping on the Dutch text still works, just less well across languages
+            print(f"translate: {e}", flush=True)
+    todo = db.execute("SELECT id, COALESCE(title_en, title), COALESCE(summary_en, summary) FROM articles"
+                      " WHERE vec IS NULL AND story IS NULL").fetchall()
     for i in range(0, len(todo), 256):
         batch = todo[i:i + 256]
         vecs = embed([f"{title}. {summary[:300]}" for _, title, summary in batch])
@@ -266,6 +298,210 @@ def regroup(db):
     group(db)
 
 
+class OverBudget(Exception):
+    pass
+
+
+def call_mistral(model, system, payload, max_tokens):
+    """One JSON-mode chat request. Returns the reply text and (input, output) token counts."""
+    body = json.dumps({
+        "model": model, "temperature": 0.2, "max_tokens": max_tokens, "response_format": {"type": "json_object"},
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+    }).encode()
+    headers = {"Authorization": f"Bearer {os.environ['MISTRAL_API_KEY']}", "Content-Type": "application/json"}
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(MISTRAL_URL, body, headers), timeout=180) as r:
+                reply = json.load(r)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504) or attempt == 3:
+                raise
+            time.sleep(float(e.headers.get("Retry-After") or 5 * 2 ** attempt))
+    content = reply["choices"][0]["message"]["content"]
+    if isinstance(content, list):  # models that reason send thinking and text chunks
+        content = "".join(c.get("text", "") for c in content if c.get("type") == "text")
+    return content, (reply["usage"]["prompt_tokens"], reply["usage"]["completion_tokens"])
+
+
+def ask(db, model, system, payload, max_tokens):
+    """call_mistral within the daily budget; the cost is recorded before the reply is parsed."""
+    day = now().date().isoformat()
+    spent = db.execute("SELECT usd FROM spend WHERE day = ?", (day,)).fetchone()
+    if spent and spent[0] >= DAILY_BUDGET:
+        raise OverBudget(f"daily Mistral budget of ${DAILY_BUDGET:.2f} reached")
+    content, (tokens_in, tokens_out) = call_mistral(model, system, payload, max_tokens)
+    usd = (tokens_in * PRICES[model][0] + tokens_out * PRICES[model][1]) / 1e6
+    db.execute("INSERT INTO spend VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET usd = usd + excluded.usd", (day, usd))
+    db.commit()
+    return json.loads(content)
+
+
+TRANSLATE_PROMPT = """Translate each item's Dutch title and text into English.
+Keep names, numbers and meaning exactly; add nothing, leave out nothing, keep the tone neutral.
+Return JSON: {"items": [{"id": <id>, "title": "<English title>", "text": "<English text>"}]}"""
+
+
+def translate(db):
+    """English titles and teasers for Dutch articles, shown on the page and used for grouping."""
+    todo = db.execute("SELECT id, title, summary FROM articles WHERE lang = 'nl' AND title_en IS NULL"
+                      " AND published >= ?", (iso(now() - SHOW),)).fetchall()
+    for i in range(0, len(todo), 20):
+        batch = {r[0]: r for r in todo[i:i + 20]}
+        result = ask(db, TRANSLATOR, TRANSLATE_PROMPT,
+                     {"items": [{"id": a, "title": t, "text": s[:300]} for a, t, s in batch.values()]}, 4000)
+        for item in result.get("items", []):
+            if item.get("id") in batch and isinstance(item.get("title"), str) and item["title"].strip():
+                db.execute("UPDATE articles SET title_en = ?, summary_en = ? WHERE id = ?",
+                           (item["title"].strip(), str(item.get("text") or "").strip(), item["id"]))
+        db.commit()
+    print(f"translate: {len(todo)} Dutch articles", flush=True)
+
+
+RULES = """Rules:
+- Write English only, in plain neutral language: no loaded or emotive words, no speculation, nothing the articles don't say.
+- Article texts are often teasers cut off mid-sentence. Never fill in what was cut off: a date, a number or a name
+  the text doesn't give is left out. Use each article's publication time to place words like "Saturday" or "today".
+- State facts that several outlets report plainly. Every claim only one outlet reports gets that outlet's name:
+  "according to Euronews". If a story has only one outlet, open with it: "RTV Oost reports that ...".
+- Mark disputed points as disputed, naming who disputes them.
+- Articles marked opinion are commentary. Never present their claims as facts. If a story has only opinion articles,
+  describe what is being debated and the facts the debate is about.
+- Quotes: only from articles marked opinion, at most 3 per story, each one sentence or less, copied exactly
+  (same words, same language) from that article's title or text, with an English translation (quote_en).
+- Refer to stories and articles by their key exactly as given ("s1", "a4")."""
+
+NEW_PROMPT = """You write the stories for a private news app. Each input story is a group of articles about one event,
+possibly in Dutch. For every story write:
+- headline: neutral and factual, at most 14 words.
+- summary: what happened, 2 to 4 sentences, at most 90 words.
+- region: the most specific place the story is about. One of: Zwolle (the city of Zwolle), Overijssel (elsewhere in the
+  province), NL (elsewhere in the Netherlands, or national), EU (EU institutions or other European countries), US,
+  Global (anywhere else, or worldwide), or None when it is about no place (a product launch, a study, an album).
+""" + RULES + """
+Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "region": "...",
+"quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}"""
+
+UPDATE_PROMPT = """You keep running stories in a private news app up to date. Each input story has its current text
+(headline, summary, earlier updates) and new articles. Write an update with only what the new articles add that the
+current text doesn't say yet: 1 to 3 sentences, at most 60 words. Never repeat or rewrite the current text.
+If new reporting contradicts it, say so: "Earlier reports said X; outlets now report Y."
+If the new articles add nothing, the update is null. List the keys of the articles the update is based on.
+""" + RULES + """
+Return JSON: {"stories": [{"key": "s1", "update": "..." or null, "sources": ["a1"],
+"quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}"""
+
+QUOTE_MARKS = str.maketrans({c: "'" for c in "‘’‚‛"} | {c: '"' for c in "“”„‟«»"})
+
+
+def normalized(s):
+    return " ".join(s.translate(QUOTE_MARKS).casefold().split())
+
+
+def save_quotes(db, story, quotes, articles):
+    """Keep a quote only if it comes from an opinion article in this batch and appears there word for word."""
+    for q in quotes if isinstance(quotes, list) else []:
+        a = articles.get(q.get("article")) if isinstance(q, dict) else None
+        quote, quote_en = (str(q.get("quote") or ""), str(q.get("quote_en") or "")) if a else ("", "")
+        core = normalized(quote).strip("'\" .,")
+        if a and a["opinion"] and quote_en and len(core.split()) >= 4 and core in normalized(f"{a['title']} {a['text']}"):
+            db.execute("INSERT INTO quotes(story, article, quote, quote_en) VALUES (?,?,?,?)",
+                       (story, a["id"], quote.strip(), quote_en.strip()))
+
+
+def batches(stories, max_stories, max_articles):
+    batch, size = [], 0
+    for story in stories:
+        if batch and (len(batch) == max_stories or size + len(story["articles"]) > max_articles):
+            yield batch
+            batch, size = [], 0
+        batch.append(story)
+        size += len(story["articles"])
+    if batch:
+        yield batch
+
+
+def write(db):
+    """Mistral writes new stories and adds updates to written ones. Stories only an opinion column covers wait."""
+    if not os.environ.get("MISTRAL_API_KEY"):
+        return
+    rows = db.execute("""SELECT a.story, a.id, a.outlet, a.published, a.opinion, a.title, a.summary, a.written,
+                                s.headline, s.summary
+                         FROM articles a JOIN stories s ON s.id = a.story
+                         WHERE s.updated >= ? ORDER BY a.published""", (iso(now() - SHOW),)).fetchall()
+    stories = defaultdict(list)
+    for r in rows:
+        stories[r[0]].append(r)
+    new, updates = [], []
+    for sid, rs in stories.items():
+        sources = source_count([(r[2], r[5]) for r in rs])
+        if sources < 2 and all(r[4] for r in rs):
+            continue
+        fresh = [r for r in rs if not r[7]] if rs[0][8] else rs
+        published = lambda p: datetime.fromisoformat(p).astimezone().strftime("%a %d %b %Y %H:%M")
+        articles = [dict(id=r[1], outlet=r[2], published=published(r[3]), opinion=bool(r[4]), title=r[5], text=r[6][:500])
+                    for r in fresh[:30]]
+        if not articles:
+            continue
+        story = dict(id=sid, sources=sources, articles=articles)
+        if rs[0][8]:
+            earlier = [u[0] for u in db.execute("SELECT text FROM updates WHERE story = ? ORDER BY at", (sid,))]
+            updates.append(story | {"current": dict(headline=rs[0][8], summary=rs[0][9], updates=earlier)})
+        else:
+            new.append(story)
+    new.sort(key=lambda st: -st["sources"])
+    updates.sort(key=lambda st: -st["sources"])
+    # Stories with several sources first, then updates, then single-source stories, in case the budget runs out.
+    work = ([(NEW_PROMPT, b) for b in batches([st for st in new if st["sources"] > 1], 6, 40)]
+            + [(UPDATE_PROMPT, b) for b in batches(updates, 6, 40)]
+            + [(NEW_PROMPT, b) for b in batches([st for st in new if st["sources"] == 1], 10, 20)])
+    written = updated = 0
+    try:
+        for prompt, batch in work:
+            # Short keys per request: models copy "s2" and "a7" back reliably, long database ids not always.
+            keyed, stories, n = {}, [], 0
+            for i, st in enumerate(batch, 1):
+                articles = {}
+                for a in st["articles"]:
+                    n += 1
+                    articles[f"a{n}"] = a
+                keyed[f"s{i}"] = (st, articles)
+                stories.append({"key": f"s{i}", "articles": [{"key": k} | {f: v for f, v in a.items() if f != "id"}
+                                                            for k, a in articles.items()]}
+                               | ({"current": st["current"]} if "current" in st else {}))
+            try:
+                result = ask(db, WRITER, prompt, {"stories": stories}, 4000)
+            except (ValueError, urllib.error.HTTPError) as e:  # a bad reply or request: skip it, retry next run
+                print(f"write: batch skipped ({e})", flush=True)
+                continue
+            for item in result.get("stories", []) if isinstance(result, dict) else []:
+                st, articles = keyed.pop(item.get("key"), (None, None)) if isinstance(item, dict) else (None, None)
+                if not st:
+                    continue
+                if prompt is NEW_PROMPT:
+                    headline, summary = str(item.get("headline") or "").strip(), str(item.get("summary") or "").strip()
+                    if not headline or not summary:
+                        continue
+                    region = item.get("region") if item.get("region") in REGIONS else None
+                    db.execute("UPDATE stories SET headline = ?, summary = ?, region = ? WHERE id = ?",
+                               (headline, summary, region, st["id"]))
+                    written += 1
+                elif isinstance(item.get("update"), str) and item["update"].strip():
+                    used = [articles[k]["id"] for k in item.get("sources") or [] if k in articles]
+                    used = used or [a["id"] for a in articles.values()]
+                    db.execute("INSERT INTO updates(story, at, text, articles) VALUES (?,?,?,?)",
+                               (st["id"], iso(now()), item["update"].strip(), json.dumps(used)))
+                    updated += 1
+                save_quotes(db, st["id"], item.get("quotes"), articles)
+                db.executemany("UPDATE articles SET written = 1 WHERE id = ?", [(a["id"],) for a in articles.values()])
+            db.commit()
+    except OverBudget as e:
+        print(f"write: {e}", flush=True)
+    spent = db.execute("SELECT usd FROM spend WHERE day = ?", (now().date().isoformat(),)).fetchone()
+    print(f"write: {written} new stories, {updated} updates, ${spent[0] if spent else 0:.3f} spent today", flush=True)
+
+
 def esc(s):
     return html.escape(str(s))
 
@@ -274,10 +510,10 @@ def when(published):
     return datetime.fromisoformat(published).astimezone().strftime("%a %H:%M")
 
 
-def source_count(arts):
-    """Outlets covering a story, with identical headlines (syndicated copies, like one DPG article
-    in AD, Tubantia and De Stentor) counting as one source."""
-    parent = {a[1]: a[1] for a in arts}
+def source_count(pairs):
+    """Outlets covering a story, from (outlet, headline) pairs. Identical headlines (syndicated copies, like one
+    DPG article in AD, Tubantia and De Stentor) make their outlets count as one source."""
+    parent = {outlet: outlet for outlet, _ in pairs}
 
     def root(outlet):
         while parent[outlet] != outlet:
@@ -285,56 +521,96 @@ def source_count(arts):
         return outlet
 
     first = {}
-    for a in arts:
-        title = " ".join(a[3].casefold().split())
+    for outlet, title in pairs:
+        title = " ".join(title.casefold().split())
         if title in first:
-            parent[root(a[1])] = root(first[title])
+            parent[root(outlet)] = root(first[title])
         else:
-            first[title] = a[1]
+            first[title] = outlet
     return len({root(outlet) for outlet in parent})
 
 
 def article_html(a):
-    _, outlet, _, title, url, published, opinion = a
+    _, outlet, _, title, url, published, opinion, _, _ = a
     tag = ' <span class="tag">opinion</span>' if opinion else ""
     return (f'<li><span class="outlet">{esc(outlet)}</span> <a href="{esc(url)}" target="_blank" rel="noreferrer">'
             f'{esc(title)}</a>{tag} <time>{when(published)}</time></li>')
 
 
-def story_html(arts):
-    sources = source_count(arts)
-    regions = " ".join(sorted({a[2] for a in arts if a[2]}))
+def link(url, label, cls=""):
+    attr = f' class="{cls}"' if cls else ""
+    return f'<a{attr} href="{esc(url)}" target="_blank" rel="noreferrer">{esc(label)}</a>'
+
+
+def story_html(s):
+    arts, sources = s["arts"], s["sources"]
+    by_id = {a[8]: a for a in arts}
     items = "".join(article_html(a) for a in arts[:5])
     more = "".join(article_html(a) for a in arts[5:])
     if more:
         items += f'<li><details><summary>{len(arts) - 5} more</summary><ul>{more}</ul></details></li>'
-    return (f'<article class="story" data-r="{esc(regions)}"><div class="count"><b>{sources}</b>'
+    body = f'<h2>{esc(s["headline"] or arts[0][3])}</h2>'
+    if s["summary"]:
+        body += f'<p class="summary">{esc(s["summary"])}</p>'
+    if s["updates"]:
+        body += '<ul class="updates">' + "".join(
+            f'<li><time>{when(at)}</time> {esc(text)} <span class="from">Sources: '
+            + ", ".join(link(by_id[a][4], by_id[a][1]) for a in json.loads(ids) if a in by_id) + "</span></li>"
+            for at, text, ids in s["updates"]) + "</ul>"
+    if s["quotes"]:
+        body += '<ul class="quotes">' + "".join(
+            f'<li><q>{esc(quote_en)}</q> <span class="from">{esc(outlet)}'
+            f'{", translated" if normalized(quote) != normalized(quote_en) else ""} {link(url, "Source", "source")}</span></li>'
+            for quote, quote_en, outlet, url in s["quotes"]) + "</ul>"
+    return (f'<article class="story" data-r="{esc(" ".join(s["regions"]))}"><div class="count"><b>{sources}</b>'
             f'<span>{"sources" if sources > 1 else "source"}</span></div>'
-            f'<div><h2>{esc(arts[0][3])}</h2><ul>{items}</ul></div></article>')
+            f'<div>{body}<ul class="articles">{items}</ul></div></article>')
 
 
 def render(db):
     """The page body; the server adds the document head, the artifact snapshot uses it as is."""
-    rows = db.execute("""SELECT a.story, a.outlet, a.region, a.title, a.url, a.published, a.opinion
+    since = (iso(now() - SHOW),)
+    rows = db.execute("""SELECT a.story, a.outlet, a.region, COALESCE(a.title_en, a.title), a.url, a.published,
+                                a.opinion, a.title, a.id
                          FROM articles a JOIN stories s ON s.id = a.story
-                         WHERE s.updated >= ? ORDER BY a.published""", (iso(now() - SHOW),)).fetchall()
+                         WHERE s.updated >= ? ORDER BY a.published""", since).fetchall()
     by_story = defaultdict(list)
     for r in rows:
         by_story[r[0]].append(r)
-    counted = sorted(((source_count(arts), arts) for arts in by_story.values()),
-                     key=lambda c: (c[0], c[1][-1][5]), reverse=True)
-    multi = [arts for n, arts in counted if n > 1]
-    single = [arts for n, arts in counted if n == 1]
+    written = {r[0]: r[1:] for r in db.execute(
+        "SELECT id, headline, summary, region FROM stories WHERE updated >= ? AND headline IS NOT NULL", since)}
+    updates, quotes = defaultdict(list), defaultdict(list)
+    for r in db.execute("""SELECT u.story, u.at, u.text, u.articles FROM updates u JOIN stories s ON s.id = u.story
+                           WHERE s.updated >= ? ORDER BY u.at""", since):
+        updates[r[0]].append(r[1:])
+    for r in db.execute("""SELECT q.story, q.quote, q.quote_en, a.outlet, a.url FROM quotes q
+                           JOIN articles a ON a.id = q.article JOIN stories s ON s.id = q.story
+                           WHERE s.updated >= ? ORDER BY q.id""", since):
+        quotes[r[0]].append(r[1:])
+    stories = []
+    for sid, arts in by_story.items():
+        sources = source_count([(a[1], a[7]) for a in arts])
+        if sources < 2 and all(a[6] for a in arts):
+            continue  # a lone opinion column waits until the topic gets more coverage
+        headline, summary, region = written.get(sid, (None, None, None))
+        # Once written, the region is Mistral's reading of what the story is about; before that, the outlets' regions.
+        regions = ([region] if region else []) if headline else sorted({a[2] for a in arts if a[2]})
+        stories.append(dict(arts=arts, sources=sources, headline=headline, summary=summary, regions=regions,
+                            updates=updates[sid], quotes=quotes[sid]))
+    stories.sort(key=lambda s: (s["sources"], s["arts"][-1][5]), reverse=True)
+    multi = [s for s in stories if s["sources"] > 1]
+    single = [s for s in stories if s["sources"] == 1]
+    spent = db.execute("SELECT usd FROM spend WHERE day = ?", (now().date().isoformat(),)).fetchone()
     sources = db.execute("SELECT name, url, items, error FROM sources ORDER BY error IS NULL, name").fetchall()
     failing = [s for s in sources if s[3]]
     chips = f'<button type="button" data-filter="All" aria-pressed="true">All <span>{len(multi)}</span></button>'
     for r in REGIONS:
-        n = sum(1 for s in multi if any(a[2] == r for a in s))
+        n = sum(1 for s in multi if r in s["regions"])
         chips += f'<button type="button" data-filter="{r}" aria-pressed="false">{r} <span>{n}</span></button>'
     source_rows = "".join(
         f'<tr class="{"bad" if e else ""}"><td><a href="{esc(u)}" target="_blank" rel="noreferrer">{esc(n)}</a></td>'
         f'<td class="num">{i}</td><td>{esc(e or "ok")}</td></tr>' for n, u, i, e in sources)
-    return f"""<title>News grouping check</title>
+    return f"""<title>News story check</title>
 <style>
 :root {{
   --ground: #f3f5f8; --surface: #ffffff; --ink: #17202c; --muted: #5a6573; --rule: #dbe0e7;
@@ -374,6 +650,14 @@ button:focus-visible, a:focus-visible, summary:focus-visible {{ outline: 2px sol
 .count span {{ font-size: 0.65rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }}
 .story h2 {{ font: 600 1.15rem/1.3 var(--serif); margin: 0 0 8px; text-wrap: balance; overflow-wrap: anywhere; }}
 .story ul {{ list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 0.88rem; }}
+.summary {{ margin: 0 0 10px; max-width: 65ch; }}
+.story ul.updates {{ margin-bottom: 10px; padding-left: 10px; border-left: 2px solid var(--accent); font-size: 0.92rem; }}
+.story ul.quotes {{ margin-bottom: 10px; font-size: 0.92rem; }}
+q {{ font-family: var(--serif); font-style: italic; }}
+.from {{ color: var(--muted); font-size: 0.8rem; }}
+.from a {{ color: var(--muted); }}
+a.source {{ font: 500 0.72rem var(--sans); color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0 5px; text-decoration: none; }}
+.story ul.articles {{ padding-top: 8px; border-top: 1px dashed var(--rule); }}
 .story li {{ overflow-wrap: anywhere; }}
 .story a {{ color: var(--ink); text-decoration-color: var(--rule); text-underline-offset: 3px; }}
 .story a:hover {{ text-decoration-color: var(--accent); }}
@@ -397,11 +681,12 @@ tr.bad td a {{ color: var(--bad); }}
 </style>
 <main>
 <header>
-  <h1>Grouping check</h1>
-  <p>Stories with news in the last 48 hours. Stories with the most independent sources come first; copies of one article in sister papers count once.</p>
+  <h1>Story check</h1>
+  <p>Stories with news in the last 48 hours, grouped from the articles below each one and written by Mistral. Stories with the most independent sources come first; copies of one article in sister papers count once.</p>
   <div class="stats">
     <span><b>{len(rows)}</b> articles</span><span><b>{len(multi)}</b> stories with 2+ sources</span>
     <span><b>{len(single)}</b> single-source stories</span><span>threshold <b>{THRESHOLD:.2f}</b></span>
+    <span>Mistral today <b>${spent[0] if spent else 0:.2f}</b></span>
     <span>built <b>{now().astimezone().strftime("%a %d %b %H:%M")}</b></span>
   </div>
 </header>
@@ -467,6 +752,7 @@ def run():
                 collect(db)
                 if grouped is None or time.monotonic() - grouped >= GROUP_EVERY:
                     group(db)
+                    write(db)
                     grouped = time.monotonic()
         except Exception:
             traceback.print_exc()
@@ -482,4 +768,4 @@ if __name__ == "__main__":
             if command == "page":
                 print(render(db))
             else:
-                {"collect": collect, "group": group, "regroup": regroup}[command](db)
+                {"collect": collect, "group": group, "regroup": regroup, "translate": translate, "write": write}[command](db)
