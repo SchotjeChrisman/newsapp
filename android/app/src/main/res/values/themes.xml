@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.News" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window</item>
+    </style>
+    <color name="window">#FFF8F9FC</color>
+    <color name="launcher_background">#FF17202C</color>
+</resources>
