@@ -52,8 +52,8 @@ DUTCH_REGIONS = {"Zwolle", "Overijssel", "NL"}  # sources there write Dutch unle
 INTERESTS = {
     "AI": "artificial intelligence: AI models and products, AI companies, chips for AI, AI rules, AI research",
     "Tech": "technology: tech companies, software, apps, gadgets, the internet, telecom, cybersecurity",
-    "S&P 500": "the US stock market: the S&P 500 and other US indexes, results and share moves of large US-listed "
-               "companies, the Federal Reserve and economic news that moves US stocks",
+    "S&P 500": "the US stock market itself: moves of the S&P 500 and other US indexes, results and share moves of "
+               "large US-listed companies, Federal Reserve rate decisions. Not general economic or political news",
     "Science": "science: research findings, space, medicine and health research, climate and nature science",
     "Football": "association football (soccer) anywhere in the world: clubs, players, transfers, leagues, national "
                 "teams. Not American football",
@@ -684,9 +684,10 @@ def write(db):
 
 
 def tag(db):
-    """Sorts the written stories into the reader's interests, 100 per request. A story is tagged once; a failed request
-    stops tagging until the next run."""
+    """Sorts the written stories into the reader's interests, 100 per request. A story is tagged once; one the reply
+    leaves out is sent again next run. When Claude fails, Mistral tags the rest of the run."""
     writers = available_writers()
+    names = {re.sub(r"\W", "", name).casefold(): name for name in INTERESTS}  # Mistral may write "S&P500" or "football"
     rows = db.execute("SELECT id, headline, summary FROM stories WHERE updated >= ? AND headline IS NOT NULL"
                       " AND interests IS NULL ORDER BY id", (iso(now() - SHOW),)).fetchall()
     tagged, start = 0, 0
@@ -701,19 +702,18 @@ def tag(db):
             for item in items if isinstance(items, list) else []:
                 key = item.get("key") if isinstance(item, dict) else None
                 sid = keyed.pop(key, None) if isinstance(key, str) else None
-                if sid:
-                    interests = item.get("interests")
-                    picked = [name for name in INTERESTS if isinstance(interests, list) and name in interests]
+                interests = item.get("interests") if sid else None
+                if isinstance(interests, list):
+                    given = {names.get(re.sub(r"\W", "", x).casefold()) for x in interests if isinstance(x, str)}
+                    picked = [name for name in INTERESTS if name in given]
                     db.execute("UPDATE stories SET interests = ? WHERE id = ?", (json.dumps(picked), sid))
                     tagged += bool(picked)
-            if len(keyed) == len(batch):
-                raise ValueError("no story in the reply")
-            # Left out of a valid reply means no interest fits; sending them again would get the same answer.
-            db.executemany("UPDATE stories SET interests = '[]' WHERE id = ?", [(sid,) for sid in keyed.values()])
             db.commit()
+            if keyed:
+                print(f"tag: {len(keyed)} of {len(batch)} stories missing from the reply, sent again next run", flush=True)
             start += 100
-        except ClaudeUnavailable as e:
-            print(f"tag: Claude unavailable ({e}), switching to Mistral", flush=True)
+        except (ClaudeUnavailable, ClaudeFailed) as e:
+            print(f"tag: Claude failed ({e}), switching to Mistral", flush=True)
             writers.pop(0)
         except (OverBudget, ValueError, TypeError, KeyError, AttributeError, OSError, http.client.HTTPException) as e:
             db.rollback()

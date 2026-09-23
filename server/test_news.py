@@ -438,21 +438,26 @@ def test_tag():
 
     def fake(model, system, payload, max_tokens):
         seen.append([st["key"] for st in payload["stories"]])
-        return json.dumps({"stories": [{"key": "s1", "interests": ["Football", "Basketball"]},
-                                       {"key": "s2", "interests": ["S&P 500", "AI"]}, {"key": "s3"}]}), (10, 10)
+        return json.dumps({"stories": [{"key": "s1", "interests": ["football", "Basketball"]},
+                                       {"key": "s2", "interests": ["S&P500", "AI"]}]}), (10, 10)
 
     news.call_claude, news.call_mistral = unavailable, fake
     news.tag(db)
     assert seen == [["s1", "s2", "s3"]], "Mistral takes over; only written stories are sorted"
     assert db.execute("SELECT id, interests FROM stories ORDER BY id").fetchall() == [
-        (1, '["Football"]'), (2, '["AI", "S&P 500"]'), (3, "[]"), (4, None)], \
-        "unknown interests are dropped; a story left out of the reply has none"
+        (1, '["Football"]'), (2, '["AI", "S&P 500"]'), (3, None), (4, None)], \
+        "near-miss names count, unknown ones are dropped, and a story left out of the reply stays untagged"
     news.tag(db)
-    assert len(seen) == 1, "a story is sorted once"
-    db.execute("UPDATE stories SET interests = NULL WHERE id = 3")
-    news.call_mistral = lambda *_: (json.dumps({"stories": []}), (10, 10))
+    assert seen[-1] == ["s1"], "a story is sorted once; one left out is sent again"
+
+    def failing(model, system, payload):
+        raise news.ClaudeFailed("unreadable reply")
+
+    db.execute("UPDATE stories SET interests = NULL")
+    news.call_claude = failing
     news.tag(db)
-    assert db.execute("SELECT interests FROM stories WHERE id = 3").fetchone() == (None,), "an empty reply tags nothing"
+    assert db.execute("SELECT interests FROM stories WHERE id = 1").fetchone() == ('["Football"]',), \
+        "Mistral takes over when a Claude request fails"
     data = news.api(db)
     assert data["tabs"] == news.REGIONS + list(news.INTERESTS)
     assert {st["id"]: st["tabs"] for st in data["stories"]}[2] == ["AI", "S&P 500"]
