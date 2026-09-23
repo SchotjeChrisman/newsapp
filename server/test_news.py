@@ -303,7 +303,7 @@ def test_write():
     assert [a["outlet"] for a in story["summary_from"]] == ["NOS", "BBC", "Trouw", "Tubantia"]
     assert [(a["outlet"], a["lean"], a["opinion"]) for a in story["articles"][:3]] == [
         ("NOS", "center", False), ("BBC", None, False), ("Trouw", "left", True)]
-    assert data["tabs"] == news.REGIONS
+    assert data["tabs"] == news.REGIONS + list(news.INTERESTS)
 
     add_article(db, 7, 1, "AD", "Kabinet valt, koning aanvaardt ontslag", lang="nl")
     for reply in ({"stories": [{"key": ["s1"]}, "junk", {"key": "s1", "facts": [["a1"], {"article": ["a1"], "fact": "y"},
@@ -420,6 +420,51 @@ def test_claude_writer():
     del os.environ["MISTRAL_API_KEY"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
 
 
+def test_tag():
+    originals = news.call_claude, news.call_mistral
+    os.environ["MISTRAL_API_KEY"] = "test"
+    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "test"
+    db = news.connect()
+    t = news.iso(news.now())
+    db.execute("INSERT INTO stories(id, updated, n, headline, summary) VALUES (1, ?, 1, 'Ajax beat PSV', 'Ajax won.'),"
+               " (2, ?, 1, 'Nvidia shares rise', 'Nvidia rose.'), (3, ?, 1, 'Road works', 'A road closes.')", (t,) * 3)
+    db.execute("INSERT INTO stories(id, updated, n) VALUES (4, ?, 1)", (t,))
+    for aid, sid in ((11, 1), (12, 2), (13, 3), (14, 4)):
+        add_article(db, aid, sid, "NOS", f"Article {aid}")
+    seen = []
+
+    def unavailable(model, system, payload):
+        raise news.ClaudeUnavailable("usage limit")
+
+    def fake(model, system, payload, max_tokens):
+        seen.append([st["key"] for st in payload["stories"]])
+        return json.dumps({"stories": [{"key": "s1", "interests": ["football", "Basketball"]},
+                                       {"key": "s2", "interests": ["S&P500", "AI"]}]}), (10, 10)
+
+    news.call_claude, news.call_mistral = unavailable, fake
+    news.tag(db)
+    assert seen == [["s1", "s2", "s3"]], "Mistral takes over; only written stories are sorted"
+    assert db.execute("SELECT id, interests FROM stories ORDER BY id").fetchall() == [
+        (1, '["Football"]'), (2, '["AI", "S&P 500"]'), (3, None), (4, None)], \
+        "near-miss names count, unknown ones are dropped, and a story left out of the reply stays untagged"
+    news.tag(db)
+    assert seen[-1] == ["s1"], "a story is sorted once; one left out is sent again"
+
+    def failing(model, system, payload):
+        raise news.ClaudeFailed("unreadable reply")
+
+    db.execute("UPDATE stories SET interests = NULL")
+    news.call_claude = failing
+    news.tag(db)
+    assert db.execute("SELECT interests FROM stories WHERE id = 1").fetchone() == ('["Football"]',), \
+        "Mistral takes over when a Claude request fails"
+    data = news.api(db)
+    assert data["tabs"] == news.REGIONS + list(news.INTERESTS)
+    assert {st["id"]: st["tabs"] for st in data["stories"]}[2] == ["AI", "S&P 500"]
+    news.call_claude, news.call_mistral = originals
+    del os.environ["MISTRAL_API_KEY"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+
+
 def test_http():
     server = news.ThreadingHTTPServer(("127.0.0.1", 0), news.Page)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -449,5 +494,6 @@ test_language_backfill()
 test_mistral_articles()
 test_write()
 test_claude_writer()
+test_tag()
 test_http()
 print("ok")
