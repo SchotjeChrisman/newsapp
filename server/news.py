@@ -60,7 +60,7 @@ DAILY_BUDGET = 0.60
 # it only guards the subscription against a runaway loop.
 CLAUDE_WRITER = "claude-sonnet-5"
 CLAUDE_EFFORT = "low"
-CLAUDE_DAILY_BUDGET = 20.00
+CLAUDE_DAILY_BUDGET = 50.00
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS articles(
