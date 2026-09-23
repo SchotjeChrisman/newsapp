@@ -12,7 +12,18 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.rememberTopAppBarState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -22,6 +33,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import java.io.File
 import java.net.ConnectException
@@ -41,6 +53,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        // No grey scrim behind three-button navigation: the app's own bar is already there.
+        if (Build.VERSION.SDK_INT >= 29) window.isNavigationBarContrastEnforced = false
         if (savedInstanceState == null) state.openReport = intent.getBooleanExtra(MorningReport.OPEN, false)
         MorningReport.ensure(this)
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -153,6 +167,7 @@ class NewsState(context: Context) {
 
 enum class Screen { Stories, Story, Report, Search, Feeds, Server }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun App(state: NewsState) {
     val scope = rememberCoroutineScope()
@@ -161,10 +176,16 @@ fun App(state: NewsState) {
     var storyFrom by rememberSaveable { mutableStateOf(Screen.Stories) }
     var tab by rememberSaveable { mutableStateOf("All") }
     var query by rememberSaveable { mutableStateOf("") }
-    // One scroll position per tab, kept while a story is open.
+    // Scroll positions of the main places (one per tab for the news), kept while a story is open or another place shows.
     val lists = remember { mutableMapOf<String, LazyListState>() }
+    val newsBar = rememberTopAppBarState()
+    val reportList = rememberLazyListState()
+    val reportBar = rememberTopAppBarState()
+    val searchList = rememberLazyListState()
     val news = state.news
-    val navBar = @Composable { NavBar(screen) { screen = it } }
+    val rail = wide()
+    val main = screen == Screen.Stories || screen == Screen.Report || screen == Screen.Search
+    val navBar = @Composable { if (!rail) NavBar(screen) { screen = it } }
 
     BackHandler(enabled = screen != Screen.Stories && state.server.isNotBlank()) {
         screen = if (screen == Screen.Story) storyFrom else Screen.Stories
@@ -180,49 +201,60 @@ fun App(state: NewsState) {
         }
     }
 
-    when (screen) {
-        Screen.Stories -> StoriesScreen(
-            news = news,
-            loading = state.loading,
-            error = state.error,
-            tab = tab,
-            listState = lists.getOrPut(tab) { LazyListState() },
-            onTab = { tab = it },
-            onRefresh = { scope.launch { state.refresh() } },
-            onOpen = { storyId = it.id; storyFrom = Screen.Stories; screen = Screen.Story },
-            onFeeds = { screen = Screen.Feeds },
-            onServer = { screen = Screen.Server },
-            bottomBar = navBar,
-        )
-        Screen.Story -> {
-            val story = news?.stories?.find { it.id == storyId } ?: state.results?.find { it.id == storyId }
-            if (story == null) LaunchedEffect(Unit) { screen = storyFrom }
-            else StoryScreen(story, onBack = { screen = storyFrom })
+    Row(Modifier.fillMaxSize()) {
+        if (rail && main) NavRail(screen) { screen = it }
+        // The rail already keeps clear of the cutout and the system bar on its side.
+        val side = if (rail && main) Modifier.consumeWindowInsets(WindowInsets.safeDrawing.only(WindowInsetsSides.Start)) else Modifier
+        Box(Modifier.weight(1f).then(side)) {
+            when (screen) {
+                Screen.Stories -> StoriesScreen(
+                    news = news,
+                    loading = state.loading,
+                    error = state.error,
+                    tab = tab,
+                    listState = lists.getOrPut(tab) { LazyListState() },
+                    barState = newsBar,
+                    onTab = { tab = it },
+                    onRefresh = { scope.launch { state.refresh() } },
+                    onOpen = { storyId = it.id; storyFrom = Screen.Stories; screen = Screen.Story },
+                    onFeeds = { screen = Screen.Feeds },
+                    onServer = { screen = Screen.Server },
+                    bottomBar = navBar,
+                )
+                Screen.Story -> {
+                    val story = news?.stories?.find { it.id == storyId } ?: state.results?.find { it.id == storyId }
+                    if (story == null) LaunchedEffect(Unit) { screen = storyFrom }
+                    else StoryScreen(story, onBack = { screen = storyFrom })
+                }
+                Screen.Report -> ReportScreen(
+                    report = news?.report,
+                    listState = reportList,
+                    barState = reportBar,
+                    onOpen = { storyId = it; storyFrom = Screen.Report; screen = Screen.Story },
+                    bottomBar = navBar,
+                )
+                Screen.Search -> SearchScreen(
+                    query = query,
+                    onQuery = { query = it },
+                    onSearch = { scope.launch { state.search(query) } },
+                    results = state.results,
+                    searching = state.searching,
+                    error = state.searchError,
+                    listState = searchList,
+                    onOpen = { storyId = it.id; storyFrom = Screen.Search; screen = Screen.Story },
+                    bottomBar = navBar,
+                )
+                Screen.Feeds -> FeedsScreen(news?.feeds.orEmpty(), onBack = { screen = Screen.Stories })
+                Screen.Server -> ServerScreen(
+                    current = state.server,
+                    onBack = if (state.server.isBlank()) null else ({ screen = Screen.Stories }),
+                    onSave = {
+                        state.changeServer(it)
+                        screen = Screen.Stories
+                        scope.launch { state.refresh() }
+                    },
+                )
+            }
         }
-        Screen.Report -> ReportScreen(
-            report = news?.report,
-            onOpen = { storyId = it; storyFrom = Screen.Report; screen = Screen.Story },
-            bottomBar = navBar,
-        )
-        Screen.Search -> SearchScreen(
-            query = query,
-            onQuery = { query = it },
-            onSearch = { scope.launch { state.search(query) } },
-            results = state.results,
-            searching = state.searching,
-            error = state.searchError,
-            onOpen = { storyId = it.id; storyFrom = Screen.Search; screen = Screen.Story },
-            bottomBar = navBar,
-        )
-        Screen.Feeds -> FeedsScreen(news?.feeds.orEmpty(), onBack = { screen = Screen.Stories })
-        Screen.Server -> ServerScreen(
-            current = state.server,
-            onBack = if (state.server.isBlank()) null else ({ screen = Screen.Stories }),
-            onSave = {
-                state.changeServer(it)
-                screen = Screen.Stories
-                scope.launch { state.refresh() }
-            },
-        )
     }
 }

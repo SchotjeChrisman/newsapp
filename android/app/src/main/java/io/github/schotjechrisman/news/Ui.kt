@@ -18,10 +18,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
@@ -50,6 +52,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MediumTopAppBar
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -63,6 +67,7 @@ import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.TopAppBarScrollBehavior
+import androidx.compose.material3.TopAppBarState
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
@@ -84,6 +89,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalUriHandler
@@ -109,8 +115,35 @@ fun NewsTheme(content: @Composable () -> Unit) {
     val context = LocalContext.current
     val colors = when {
         Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        dark -> darkColorScheme(primary = Color(0xFF9DBBFF))
-        else -> lightColorScheme(primary = Color(0xFF1D5BBF))
+        // Before Android 12 there are no wallpaper colors: a full blue scheme, so no slot falls back to Material's purple.
+        dark -> darkColorScheme(
+            primary = Color(0xFFAAC7FF), onPrimary = Color(0xFF0A305F),
+            primaryContainer = Color(0xFF284777), onPrimaryContainer = Color(0xFFD6E3FF),
+            secondary = Color(0xFFBEC6DC), onSecondary = Color(0xFF283141),
+            secondaryContainer = Color(0xFF3E4759), onSecondaryContainer = Color(0xFFDAE2F9),
+            tertiary = Color(0xFFDDBCE0), tertiaryContainer = Color(0xFF573E5C), onTertiaryContainer = Color(0xFFFAD8FD),
+            background = Color(0xFF111318), onBackground = Color(0xFFE2E2E9),
+            surface = Color(0xFF111318), onSurface = Color(0xFFE2E2E9),
+            surfaceVariant = Color(0xFF44474E), onSurfaceVariant = Color(0xFFC4C6D0),
+            outline = Color(0xFF8E9099), outlineVariant = Color(0xFF44474E),
+            surfaceContainerLowest = Color(0xFF0C0E13), surfaceContainerLow = Color(0xFF191C20),
+            surfaceContainer = Color(0xFF1D2024), surfaceContainerHigh = Color(0xFF282A2F),
+            surfaceContainerHighest = Color(0xFF33353A),
+        )
+        else -> lightColorScheme(
+            primary = Color(0xFF415F91), onPrimary = Color.White,
+            primaryContainer = Color(0xFFD6E3FF), onPrimaryContainer = Color(0xFF284777),
+            secondary = Color(0xFF565F71), onSecondary = Color.White,
+            secondaryContainer = Color(0xFFDAE2F9), onSecondaryContainer = Color(0xFF3E4759),
+            tertiary = Color(0xFF705575), tertiaryContainer = Color(0xFFFAD8FD), onTertiaryContainer = Color(0xFF573E5C),
+            background = Color(0xFFF9F9FF), onBackground = Color(0xFF191C20),
+            surface = Color(0xFFF9F9FF), onSurface = Color(0xFF191C20),
+            surfaceVariant = Color(0xFFE0E2EC), onSurfaceVariant = Color(0xFF44474E),
+            outline = Color(0xFF74777F), outlineVariant = Color(0xFFC4C6D0),
+            surfaceContainerLowest = Color.White, surfaceContainerLow = Color(0xFFF3F3FA),
+            surfaceContainer = Color(0xFFEDEDF4), surfaceContainerHigh = Color(0xFFE7E8EE),
+            surfaceContainerHighest = Color(0xFFE2E2E9),
+        )
     }
     val type = Typography()
     MaterialTheme(
@@ -161,14 +194,17 @@ private fun BackButton(onBack: () -> Unit) {
 }
 
 /** The app's three main places; a story, the feed status and the server setting open on top of them. */
+private val places = listOf(
+    Triple(Screen.Stories, "News", R.drawable.ic_notification),
+    Triple(Screen.Report, "Report", R.drawable.ic_report),
+    Triple(Screen.Search, "Search", R.drawable.ic_search),
+)
+
+/** A bar at the bottom on a phone held upright. */
 @Composable
 fun NavBar(current: Screen, onSelect: (Screen) -> Unit) {
     NavigationBar {
-        listOf(
-            Triple(Screen.Stories, "News", R.drawable.ic_notification),
-            Triple(Screen.Report, "Report", R.drawable.ic_report),
-            Triple(Screen.Search, "Search", R.drawable.ic_search),
-        ).forEach { (screen, label, icon) ->
+        places.forEach { (screen, label, icon) ->
             NavigationBarItem(
                 selected = current == screen,
                 onClick = { onSelect(screen) },
@@ -179,16 +215,37 @@ fun NavBar(current: Screen, onSelect: (Screen) -> Unit) {
     }
 }
 
-/** A big title that shrinks as the page scrolls, on the page's own color. */
+/** A rail at the side on wide screens (a phone on its side, a tablet), which leaves the height to the news. */
+@Composable
+fun NavRail(current: Screen, onSelect: (Screen) -> Unit) {
+    NavigationRail {
+        Spacer(Modifier.weight(1f))
+        places.forEach { (screen, label, icon) ->
+            NavigationRailItem(
+                selected = current == screen,
+                onClick = { onSelect(screen) },
+                icon = { Icon(painterResource(icon), contentDescription = null) },
+                label = { Text(label) },
+            )
+        }
+        Spacer(Modifier.weight(1f))
+    }
+}
+
+/** Wide enough for the rail instead of the bottom bar. */
+@Composable
+fun wide() = LocalConfiguration.current.screenWidthDp >= 600
+
+/** A big title that shrinks as the page scrolls, on the page's own color; a small one when the screen is short. */
 @Composable
 private fun TitleBar(title: String, scroll: TopAppBarScrollBehavior, actions: @Composable () -> Unit = {}) {
     val ground = MaterialTheme.colorScheme.surface
-    MediumTopAppBar(
-        title = { Text(title) },
-        actions = { actions() },
-        scrollBehavior = scroll,
-        colors = TopAppBarDefaults.topAppBarColors(containerColor = ground, scrolledContainerColor = ground),
-    )
+    val colors = TopAppBarDefaults.topAppBarColors(containerColor = ground, scrolledContainerColor = ground)
+    if (LocalConfiguration.current.screenHeightDp < 480) {
+        TopAppBar(title = { Text(title) }, actions = { actions() }, scrollBehavior = scroll, colors = colors)
+    } else {
+        MediumTopAppBar(title = { Text(title) }, actions = { actions() }, scrollBehavior = scroll, colors = colors)
+    }
 }
 
 @Composable
@@ -198,6 +255,7 @@ fun StoriesScreen(
     error: String?,
     tab: String,
     listState: LazyListState,
+    barState: TopAppBarState,
     onTab: (String) -> Unit,
     onRefresh: () -> Unit,
     onOpen: (Story) -> Unit,
@@ -206,9 +264,8 @@ fun StoriesScreen(
     bottomBar: @Composable () -> Unit,
 ) {
     var menu by remember { mutableStateOf(false) }
-    val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(barState)
     Scaffold(
-        modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
         topBar = {
             TitleBar("News", scroll) {
                 IconButton(onClick = { menu = true }) { Icon(painterResource(R.drawable.ic_more), "More") }
@@ -229,7 +286,12 @@ fun StoriesScreen(
             val tabs = listOf("All") + news.tabs
             val shown = remember(news, tab) { news.stories.filter { tab == "All" || tab in it.tabs } }
             val firstSingle = shown.indexOfFirst { it.sources < 2 }
-            LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 16.dp), modifier = Modifier.fillMaxSize()) {
+            // The title is closer to the list than pull-to-refresh: a pull first opens the title, then refreshes.
+            LazyColumn(
+                state = listState,
+                contentPadding = PaddingValues(bottom = 16.dp),
+                modifier = Modifier.fillMaxSize().nestedScroll(scroll.nestedScrollConnection),
+            ) {
                 stickyHeader { TabChips(tabs, tab, onTab) }
                 if (error != null) item { Banner(error, Modifier.padding(16.dp, 4.dp)) }
                 itemsIndexed(shown, key = { _, s -> s.id }) { i, story ->
@@ -336,6 +398,7 @@ fun SearchScreen(
     results: List<Story>?,
     searching: Boolean,
     error: String?,
+    listState: LazyListState,
     onOpen: (Story) -> Unit,
     bottomBar: @Composable () -> Unit,
 ) {
@@ -377,7 +440,12 @@ fun SearchScreen(
         bottomBar = bottomBar,
         contentWindowInsets = WindowInsets.safeDrawing,
     ) { padding ->
-        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(bottom = 16.dp)) {
+        // The keyboard covers the bottom bar, so the list keeps clear of the keyboard itself.
+        LazyColumn(
+            Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding(),
+            state = listState,
+            contentPadding = PaddingValues(bottom = 16.dp),
+        ) {
             if (searching) item { LinearProgressIndicator(Modifier.fillMaxWidth().padding(16.dp, 4.dp)) }
             if (error != null) item { Banner(error, Modifier.padding(16.dp, 4.dp)) }
             if (results.isNullOrEmpty()) {
@@ -398,8 +466,14 @@ fun SearchScreen(
 }
 
 @Composable
-fun ReportScreen(report: Report?, onOpen: (Long) -> Unit, bottomBar: @Composable () -> Unit) {
-    val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+fun ReportScreen(
+    report: Report?,
+    listState: LazyListState,
+    barState: TopAppBarState,
+    onOpen: (Long) -> Unit,
+    bottomBar: @Composable () -> Unit,
+) {
+    val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(barState)
     Scaffold(
         modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
         topBar = { TitleBar("Morning report", scroll) },
@@ -414,7 +488,7 @@ fun ReportScreen(report: Report?, onOpen: (Long) -> Unit, bottomBar: @Composable
             )
             return@Scaffold
         }
-        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp, 0.dp, 16.dp, 16.dp)) {
+        LazyColumn(Modifier.fillMaxSize().padding(padding), state = listState, contentPadding = PaddingValues(16.dp, 0.dp, 16.dp, 16.dp)) {
             item {
                 Text(
                     longDay.format(report.day),

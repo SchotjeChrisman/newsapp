@@ -1,8 +1,16 @@
+@file:OptIn(ExperimentalMaterial3Api::class)
+
 package io.github.schotjechrisman.news
 
 import android.content.res.Configuration.UI_MODE_NIGHT_YES
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.ui.Modifier
 import androidx.compose.runtime.Composable
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.TopAppBarState
 import androidx.compose.ui.tooling.preview.Preview
 import com.android.tools.screenshot.PreviewTest
 import java.time.Duration
@@ -86,9 +94,25 @@ private val news = News(
 @Composable
 fun StoriesPreview() {
     NewsTheme {
-        StoriesScreen(news, loading = false, error = null, tab = "All", listState = LazyListState(),
+        StoriesScreen(news, loading = false, error = null, tab = "All", listState = LazyListState(), barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f),
             onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onServer = {},
             bottomBar = { NavBar(Screen.Stories) {} })
+    }
+}
+
+@PreviewTest
+@Preview(name = "landscape", widthDp = 900, heightDp = 400)
+@Composable
+fun StoriesLandscapePreview() {
+    NewsTheme {
+        Row(Modifier.fillMaxSize()) {
+            NavRail(Screen.Stories) {}
+            Box(Modifier.weight(1f)) {
+                StoriesScreen(news, loading = false, error = null, tab = "All", listState = LazyListState(),
+                    barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f), onTab = {}, onRefresh = {}, onOpen = {},
+                    onFeeds = {}, onServer = {}, bottomBar = {})
+            }
+        }
     }
 }
 
@@ -99,7 +123,7 @@ fun StoriesPreview() {
 fun StoriesOfflinePreview() {
     NewsTheme {
         StoriesScreen(news, loading = false, error = "Can't find http://newsbox:8080. Is Tailscale on?", tab = "Zwolle",
-            listState = LazyListState(), onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onServer = {},
+            listState = LazyListState(), barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f), onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onServer = {},
             bottomBar = { NavBar(Screen.Stories) {} })
     }
 }
@@ -117,7 +141,7 @@ fun StoryPreview() {
 @Preview(name = "dark", widthDp = 400, heightDp = 860, uiMode = UI_MODE_NIGHT_YES)
 @Composable
 fun ReportPreview() {
-    NewsTheme { ReportScreen(report, onOpen = {}, bottomBar = { NavBar(Screen.Report) {} }) }
+    NewsTheme { ReportScreen(report, LazyListState(), TopAppBarState(-Float.MAX_VALUE, 0f, 0f), onOpen = {}, bottomBar = { NavBar(Screen.Report) {} }) }
 }
 
 @PreviewTest
@@ -127,7 +151,7 @@ fun ReportPreview() {
 fun SearchPreview() {
     NewsTheme {
         SearchScreen("pec zwolle", onQuery = {}, onSearch = {}, results = stories.drop(2), searching = false, error = null,
-            onOpen = {}, bottomBar = { NavBar(Screen.Search) {} })
+            listState = LazyListState(), onOpen = {}, bottomBar = { NavBar(Screen.Search) {} })
     }
 }
 
