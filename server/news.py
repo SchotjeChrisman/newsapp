@@ -305,7 +305,7 @@ class OverBudget(Exception):
 def call_mistral(model, system, payload, max_tokens):
     """One JSON-mode chat request. Returns the reply text and (input, output) token counts."""
     body = json.dumps({
-        "model": model, "temperature": 0.2, "max_tokens": max_tokens, "response_format": {"type": "json_object"},
+        "model": model, "temperature": 0, "max_tokens": max_tokens, "response_format": {"type": "json_object"},
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
     }).encode()
