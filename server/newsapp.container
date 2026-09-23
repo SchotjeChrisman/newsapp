@@ -1,4 +1,5 @@
 # Rootless Podman service. On the server, once:
+#   printf '%s' 'YOUR_MISTRAL_KEY' | podman secret create mistral_api_key -
 #   cp newsapp.container ~/.config/containers/systemd/
 #   loginctl enable-linger                                   # start at boot, keep running after logout
 #   systemctl --user enable --now podman-auto-update.timer   # pull new images daily
@@ -9,6 +10,7 @@ Description=Private news server
 [Container]
 Image=ghcr.io/schotjechrisman/newsapp:latest
 AutoUpdate=registry
+Secret=mistral_api_key,type=env,target=MISTRAL_API_KEY
 Volume=newsapp-data:/data
 PublishPort=8080:8080
 # Environment=NEWS_THRESHOLD=0.6
