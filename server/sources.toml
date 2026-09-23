@@ -230,3 +230,33 @@ Topics = [
 "politico.eu" = "Politico Europe"
 "RTV Focus" = "RTV Focus Zwolle"
 "Metronieuws.nl" = "Metro"
+"nytimes.com" = "The New York Times"
+
+# Lean of each outlet relative to its own country, shown only as who covered a story. Local outlets, governments,
+# institutions, state-run media and topic outlets have no rating.
+[lean]
+left = [
+  "de Volkskrant", "Trouw", "Het Parool",
+  "The New York Times", "The Washington Post", "CNN", "NPR", "NBC News", "ABC News", "CBS News", "Los Angeles Times",
+  "Politico", "Axios", "USA Today", "The Atlantic", "Vox", "Mother Jones", "Time", "The Intercept", "Slate",
+  "PBS News", "ProPublica",
+  "The Guardian", "The Independent", "Le Monde", "Der Spiegel", "The Hindu",
+]
+center = [
+  "NOS", "NOS Sport", "Nieuwsuur", "NU.nl", "RTL Nieuws", "NRC", "AD", "FD", "BNR", "EenVandaag", "Follow the Money",
+  "Nederlands Dagblad", "DutchNews.nl", "NL Times", "Metro",
+  "Politico Europe", "Euractiv", "EUobserver", "Euronews", "The Brussels Times",
+  "AP News", "The Wall Street Journal", "The Hill", "Newsweek", "Business Insider", "Semafor", "CNBC", "Fortune",
+  "Bloomberg",
+  "BBC News", "Reuters", "DW", "France 24", "RFI", "The Kyiv Independent", "South China Morning Post",
+  "The Times of India", "The Japan Times", "ABC News (Australia)", "CBC News", "Sky News", "The Economist",
+  "Financial Times", "RTÉ", "Dawn", "The Times of Israel", "The Straits Times", "Yonhap", "CNA", "The Moscow Times",
+  "Meduza", "The Sydney Morning Herald", "MercoPress", "The Conversation",
+]
+right = [
+  "De Telegraaf", "EW", "GeenStijl", "Reformatorisch Dagblad",
+  "Brussels Signal",
+  "Fox News", "Breitbart", "New York Post", "Newsmax", "Washington Examiner", "Reason", "The Daily Caller",
+  "The Federalist", "National Review", "The Washington Times", "The Daily Wire", "Washington Free Beacon",
+  "Daily Mail", "The Jerusalem Post",
+]

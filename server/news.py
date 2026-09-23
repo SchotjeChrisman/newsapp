@@ -3,6 +3,7 @@ has Mistral write them up, and serves a check page."""
 
 import email.utils
 import fnmatch
+import gzip
 import html
 import http.client
 import json
@@ -107,14 +108,22 @@ def outlet_key(name):
 
 
 def load_sources():
-    """sources.toml holds one array per region (Topics: outlets without a region), outlet aliases and ignored outlets."""
+    """sources.toml holds one array per region (Topics: outlets without a region), outlet aliases, ignored outlets
+    and the outlets' lean."""
     data = tomllib.loads(SOURCES.read_text())
     aliases, ignore = data.pop("aliases", {}), data.pop("ignore", [])
+    data.pop("lean", None)
     sources = [s | {"region": None if region == "Topics" else region,
                     "lang": s.get("lang", "nl" if region in DUTCH_REGIONS else "en")}
                for region, items in data.items() for s in items]
     names = {outlet_key(s["name"]): s["name"] for s in sources} | {outlet_key(a): n for a, n in aliases.items()}
     return sources, names, ignore
+
+
+def leans():
+    """Outlet key -> left, center or right, relative to the outlet's own country. Outlets not rated have no entry."""
+    table = tomllib.loads(SOURCES.read_text()).get("lean", {})
+    return {outlet_key(name): lean for lean, names in table.items() for name in names}
 
 
 def text(el):
@@ -656,9 +665,9 @@ def when(published):
     return datetime.fromisoformat(published).astimezone().strftime("%a %H:%M")
 
 
-def source_count(pairs):
-    """Outlets covering a story, from (outlet, headline) pairs. Identical headlines (syndicated copies, like one
-    DPG article in AD, Tubantia and De Stentor) make their outlets count as one source."""
+def independent(pairs):
+    """The outlets of a story grouped per independent source, from (outlet, headline) pairs. Identical headlines
+    (syndicated copies, like one DPG article in AD, Tubantia and De Stentor) put their outlets in one group."""
     parent = {outlet: outlet for outlet, _ in pairs}
 
     def root(outlet):
@@ -673,7 +682,24 @@ def source_count(pairs):
             parent[root(outlet)] = root(first[title])
         else:
             first[title] = outlet
-    return len({root(outlet) for outlet in parent})
+    groups = defaultdict(list)
+    for outlet in parent:
+        groups[root(outlet)].append(outlet)
+    return list(groups.values())
+
+
+def source_count(pairs):
+    return len(independent(pairs))
+
+
+def lean_counts(pairs, lean):
+    """Independent sources per lean; a group of copies takes the lean of the first rated outlet in it."""
+    counts = dict.fromkeys(["left", "center", "right"], 0)
+    for group in independent(pairs):
+        rated = [lean[outlet_key(outlet)] for outlet in group if outlet_key(outlet) in lean]
+        if rated:
+            counts[rated[0]] += 1
+    return counts
 
 
 def article_html(a):
@@ -688,12 +714,18 @@ def link(url, label, cls=""):
     return f'<a{attr} href="{esc(url)}" target="_blank" rel="noreferrer">{esc(label)}</a>'
 
 
-def sources_line(ids, by_id, most=6):
-    """ "Sources: NOS, AD" for the articles a summary or update was written from, one link per outlet."""
+def cited(ids, by_id):
+    """Outlet -> its first article's link, for the articles a summary or update was written from."""
     first = {}
     for a in json.loads(ids or "[]"):
         if a in by_id:
             first.setdefault(by_id[a][1], by_id[a][4])
+    return first
+
+
+def sources_line(ids, by_id, most=6):
+    """ "Sources: NOS, AD" for the articles a summary or update was written from, one link per outlet."""
+    first = cited(ids, by_id)
     links = [link(url, outlet) for outlet, url in list(first.items())[:most]]
     more = f" and {len(first) - most} more" if len(first) > most else ""
     return f"Sources: {', '.join(links)}{more}" if links else ""
@@ -725,8 +757,8 @@ def story_html(s):
             f'<div>{body}<ul class="articles">{items}</ul></div></article>')
 
 
-def render(db):
-    """The page body; the server adds the document head, the artifact snapshot uses it as is."""
+def shown(db):
+    """The stories with news in the last SHOW hours, most independent sources first."""
     since = (iso(now() - SHOW),)
     rows = db.execute("""SELECT a.story, a.outlet, a.region, COALESCE(a.title_en, a.title), a.url, a.published,
                                 a.opinion, a.title, a.id
@@ -754,9 +786,15 @@ def render(db):
         headline, summary, region, summary_articles = written.get(sid, (None, None, None, None))
         # Once written, the region is Mistral's reading of what the story is about; before that, the outlets' regions.
         regions = ([region] if region else []) if headline else sorted({a[2] for a in arts if a[2]})
-        stories.append(dict(arts=arts, sources=sources, headline=headline, summary=summary, regions=regions,
+        stories.append(dict(id=sid, arts=arts, sources=sources, headline=headline, summary=summary, regions=regions,
                             summary_articles=summary_articles, updates=updates[sid], quotes=quotes[sid]))
     stories.sort(key=lambda s: (s["sources"], s["arts"][-1][5]), reverse=True)
+    return stories
+
+
+def render(db):
+    """The page body; the server adds the document head, the artifact snapshot uses it as is."""
+    stories = shown(db)
     multi = [s for s in stories if s["sources"] > 1]
     single = [s for s in stories if s["sources"] == 1]
     spent = db.execute("SELECT COALESCE(usd, 0), COALESCE(claude_usd, 0) FROM spend WHERE day = ?",
@@ -845,7 +883,7 @@ tr.bad td a {{ color: var(--bad); }}
   <h1>Story check</h1>
   <p>Stories with news in the last 48 hours, grouped from the articles below each one and written by Mistral. Stories with the most independent sources come first; copies of one article in sister papers count once.</p>
   <div class="stats">
-    <span><b>{len(rows)}</b> articles</span><span><b>{len(multi)}</b> stories with 2+ sources</span>
+    <span><b>{sum(len(s["arts"]) for s in stories)}</b> articles</span><span><b>{len(multi)}</b> stories with 2+ sources</span>
     <span><b>{len(single)}</b> single-source stories</span><span>threshold <b>{THRESHOLD:.2f}</b></span>
     <span>Mistral today <b>${spent[0]:.2f}</b></span><span>Claude today <b>${spent[1]:.2f}</b> API-equivalent</span>
     <span>built <b>{now().astimezone().strftime("%a %d %b %H:%M")}</b></span>
@@ -885,18 +923,51 @@ toggle.addEventListener("click", () => {{
 """
 
 
+def api(db):
+    """Everything the app shows in one document: the stories on the check page and the feed status."""
+    lean = leans()
+    stories = []
+    for s in shown(db):
+        arts = s["arts"]
+        by_id = {a[8]: a for a in arts}
+
+        def refs(ids):
+            return [{"outlet": outlet, "url": url} for outlet, url in cited(ids, by_id).items()]
+
+        stories.append({
+            "id": s["id"], "headline": s["headline"] or arts[0][3], "summary": s["summary"], "tabs": s["regions"],
+            "sources": s["sources"], "updated": arts[-1][5], "lean": lean_counts([(a[1], a[7]) for a in arts], lean), "summary_from": refs(s["summary_articles"]),
+            "updates": [{"at": at, "text": text, "from": refs(ids)} for at, text, ids in s["updates"]],
+            "quotes": [{"text": quote_en, "outlet": outlet, "url": url, "translated": normalized(quote) != normalized(quote_en)}
+                       for quote, quote_en, outlet, url in s["quotes"]],
+            "articles": [{"outlet": a[1], "title": a[3], "url": a[4], "published": a[5], "opinion": bool(a[6]),
+                          "lean": lean.get(outlet_key(a[1]))} for a in arts]})
+    feeds = [{"name": name, "url": url, "items": items, "error": error, "checked": checked} for name, url, items, error, checked
+             in db.execute("SELECT name, url, items, error, checked FROM sources ORDER BY error IS NULL, name")]
+    return {"built": iso(now()), "tabs": REGIONS, "stories": stories, "feeds": feeds}
+
+
 HEAD = '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">'
 
 
 class Page(BaseHTTPRequestHandler):
     def do_GET(self):
-        if urlsplit(self.path).path != "/":
+        path = urlsplit(self.path).path
+        if path not in ("/", "/api/stories"):
             return self.send_error(404)
         with closing(connect()) as db:
-            body = (HEAD + render(db)).encode()
+            if path == "/":
+                body, kind = (HEAD + render(db)).encode(), "text/html; charset=utf-8"
+            else:
+                body, kind = json.dumps(api(db), ensure_ascii=False).encode(), "application/json"
+        packed = "gzip" in self.headers.get("Accept-Encoding", "")
+        if packed:
+            body = gzip.compress(body)
         try:
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", kind)
+            if packed:
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

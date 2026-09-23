@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A page whose headline is a coverage bar: left, center, right. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#FFFFFFFF" android:fillType="evenOdd" android:pathData="M39,30H69A5,5 0,0 1,74 35V73A5,5 0,0 1,69 78H39A5,5 0,0 1,34 73V35A5,5 0,0 1,39 30Z M40,38H68V45H40Z M40,51H68V54H40Z M40,58H68V61H40Z M40,65H60V68H40Z" />
+    <path android:fillColor="#FF2F6FDB" android:pathData="M40,38H48V45H40Z" />
+    <path android:fillColor="#FFA3ABB5" android:pathData="M49.5,38H60V45H49.5Z" />
+    <path android:fillColor="#FFD6453D" android:pathData="M61.5,38H68V45H61.5Z" />
+</vector>
