@@ -1,12 +1,17 @@
 package io.github.schotjechrisman.news
 
+import android.Manifest
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -30,11 +35,22 @@ import org.json.JSONException
 
 class MainActivity : ComponentActivity() {
     private val state by lazy { NewsState(applicationContext) }
+    private val askToNotify = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        if (savedInstanceState == null) state.openReport = intent.getBooleanExtra(MorningReport.OPEN, false)
+        MorningReport.ensure(this)
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            askToNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
         setContent { NewsTheme { App(state) } }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.getBooleanExtra(MorningReport.OPEN, false)) state.openReport = true
     }
 
     override fun onResume() {
@@ -57,6 +73,8 @@ class NewsState(context: Context) {
         private set
     var error by mutableStateOf<String?>(null)
         private set
+    /** Set when the morning report's notification opens the app. */
+    var openReport by mutableStateOf(false)
 
     fun changeServer(address: String) {
         val trimmed = address.trim().trimEnd('/')
@@ -102,19 +120,32 @@ class NewsState(context: Context) {
     }
 }
 
-enum class Screen { Stories, Story, Feeds, Server }
+enum class Screen { Stories, Story, Report, Feeds, Server }
 
 @Composable
 fun App(state: NewsState) {
     val scope = rememberCoroutineScope()
     var screen by rememberSaveable { mutableStateOf(if (state.server.isBlank()) Screen.Server else Screen.Stories) }
     var storyId by rememberSaveable { mutableLongStateOf(0L) }
+    var storyFrom by rememberSaveable { mutableStateOf(Screen.Stories) }
     var tab by rememberSaveable { mutableStateOf("All") }
     // One scroll position per tab, kept while a story is open.
     val lists = remember { mutableMapOf<String, LazyListState>() }
     val news = state.news
 
-    BackHandler(enabled = screen != Screen.Stories && state.server.isNotBlank()) { screen = Screen.Stories }
+    BackHandler(enabled = screen != Screen.Stories && state.server.isNotBlank()) {
+        screen = if (screen == Screen.Story) storyFrom else Screen.Stories
+    }
+    LaunchedEffect(state.openReport) {
+        if (!state.openReport) return@LaunchedEffect
+        state.openReport = false
+        if (state.server.isNotBlank()) {
+            screen = Screen.Report
+            // The last download may be from before the report was built. Launched outside this effect, which ends as
+            // soon as openReport is reset.
+            scope.launch { state.refresh() }
+        }
+    }
 
     when (screen) {
         Screen.Stories -> StoriesScreen(
@@ -125,15 +156,21 @@ fun App(state: NewsState) {
             listState = lists.getOrPut(tab) { LazyListState() },
             onTab = { tab = it },
             onRefresh = { scope.launch { state.refresh() } },
-            onOpen = { storyId = it.id; screen = Screen.Story },
+            onOpen = { storyId = it.id; storyFrom = Screen.Stories; screen = Screen.Story },
+            onReport = { screen = Screen.Report },
             onFeeds = { screen = Screen.Feeds },
             onServer = { screen = Screen.Server },
         )
         Screen.Story -> {
             val story = news?.stories?.find { it.id == storyId }
-            if (story == null) LaunchedEffect(Unit) { screen = Screen.Stories }
-            else StoryScreen(story, onBack = { screen = Screen.Stories })
+            if (story == null) LaunchedEffect(Unit) { screen = storyFrom }
+            else StoryScreen(story, onBack = { screen = storyFrom })
         }
+        Screen.Report -> ReportScreen(
+            report = news?.report,
+            onOpen = { storyId = it; storyFrom = Screen.Report; screen = Screen.Story },
+            onBack = { screen = Screen.Stories },
+        )
         Screen.Feeds -> FeedsScreen(news?.feeds.orEmpty(), onBack = { screen = Screen.Stories })
         Screen.Server -> ServerScreen(
             current = state.server,

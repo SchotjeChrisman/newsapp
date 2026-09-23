@@ -42,6 +42,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.PrimaryScrollableTabRow
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.SuggestionChip
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
@@ -111,6 +112,9 @@ private fun leanColors(): List<Color> =
     }
 
 private val clockFormat = DateTimeFormatter.ofPattern("EEE HH:mm", Locale.ENGLISH)
+private val shortDay = DateTimeFormatter.ofPattern("EEE d MMM", Locale.ENGLISH)
+private val longDay = DateTimeFormatter.ofPattern("EEEE d MMMM", Locale.ENGLISH)
+private val weekday = DateTimeFormatter.ofPattern("EEE", Locale.ENGLISH)
 
 fun clock(t: Instant): String = clockFormat.format(t.atZone(ZoneId.systemDefault()))
 
@@ -123,7 +127,7 @@ fun ago(t: Instant): String {
     }
 }
 
-private fun plural(n: Int, word: String) = if (n == 1) "1 $word" else "$n ${word}s"
+fun plural(n: Int, word: String, words: String = "${word}s") = if (n == 1) "1 $word" else "$n $words"
 
 @Composable
 private fun rememberOpener(): (String) -> Unit {
@@ -146,6 +150,7 @@ fun StoriesScreen(
     onTab: (String) -> Unit,
     onRefresh: () -> Unit,
     onOpen: (Story) -> Unit,
+    onReport: () -> Unit,
     onFeeds: () -> Unit,
     onServer: () -> Unit,
 ) {
@@ -182,6 +187,7 @@ fun StoriesScreen(
                     modifier = Modifier.fillMaxSize(),
                 ) {
                     if (error != null) item { Banner(error) }
+                    if (tab == "All" && news.report != null) item { ReportCard(news.report, onReport) }
                     itemsIndexed(shown, key = { _, s -> s.id }) { i, story ->
                         if (i == firstSingle) SectionLabel("Reported by one source", Modifier.padding(16.dp, 20.dp, 16.dp, 4.dp))
                         StoryRow(story) { onOpen(story) }
@@ -198,6 +204,79 @@ fun StoriesScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun ReportCard(report: Report, onOpen: () -> Unit) {
+    val count = report.sections.sumOf { it.stories.size }
+    Surface(
+        onClick = onOpen,
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth().padding(16.dp, 12.dp, 16.dp, 4.dp),
+    ) {
+        Column(Modifier.padding(16.dp, 12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("Morning report", style = MaterialTheme.typography.titleSmall)
+            Text(
+                listOfNotNull(shortDay.format(report.day), report.market?.let(::marketLine), plural(count, "story", "stories"))
+                    .joinToString(" \u00B7 "),
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
+@Composable
+fun ReportScreen(report: Report?, onOpen: (Long) -> Unit, onBack: () -> Unit) {
+    Scaffold(topBar = { TopAppBar(title = { Text("Morning report") }, navigationIcon = { BackButton(onBack) }) }) { padding ->
+        if (report == null) {
+            Text(
+                "No report yet. The first one comes at 05:30.",
+                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.padding(padding).padding(16.dp),
+            )
+            return@Scaffold
+        }
+        LazyColumn(
+            contentPadding = PaddingValues(16.dp, padding.calculateTopPadding(), 16.dp, padding.calculateBottomPadding() + 24.dp),
+        ) {
+            item { Text(longDay.format(report.day), style = MaterialTheme.typography.headlineSmall) }
+            report.market?.let { item { MarketRow(it) } }
+            report.sections.forEach { section ->
+                item(key = section.title) { SectionLabel(section.title, Modifier.padding(top = 24.dp, bottom = 2.dp)) }
+                items(section.stories, key = { it.id }) { story ->
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { onOpen(story.id) }.padding(vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(story.headline, style = MaterialTheme.typography.titleMedium)
+                        Text(story.gist, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MarketRow(market: Market) {
+    val dark = MaterialTheme.colorScheme.surface.luminance() < 0.5f
+    val color = when {
+        market.change > 0 -> if (dark) Color(0xFF81C995) else Color(0xFF1E7B34)
+        market.change < 0 -> if (dark) Color(0xFFF28B82) else Color(0xFFB3261E)
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Row(Modifier.padding(top = 12.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(market.name, style = MaterialTheme.typography.titleSmall)
+        Text("%,.2f".format(Locale.ENGLISH, market.close), style = MaterialTheme.typography.titleSmall)
+        Text(marketLine(market).removePrefix(market.name).trim(), style = MaterialTheme.typography.titleSmall, color = color)
+        Text(
+            "${weekday.format(market.date)} close",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

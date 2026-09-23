@@ -7,6 +7,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import com.android.tools.screenshot.PreviewTest
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 
 private fun hoursAgo(h: Long): Instant = Instant.now().minus(Duration.ofMinutes(h * 60 + 7))
 
@@ -52,6 +53,21 @@ private val stories = listOf(
     ),
 )
 
+private val report = Report(
+    day = LocalDate.now(),
+    market = Market("S&P 500", 7746.07, -0.26, LocalDate.now().minusDays(1)),
+    sections = listOf(
+        Section("Zwolle", listOf(ReportStory(3, "Zwolle court briefly evacuated after fire in parking garage",
+            "A fire in the parking garage under the Zwolle courthouse forced a short evacuation during a hearing; no one was hurt.", 8))),
+        Section("NL", listOf(ReportStory(2, stories[1].headline,
+            "The cabinet's 2027 budget cuts income tax for middle incomes and raises spending on defence.", 11))),
+        Section("Global", listOf(ReportStory(1, iran.headline,
+            "Trump told the UN he may strike a deal with Iran or attack it; US and Iranian officials later met.", 28))),
+        Section("AI", listOf(ReportStory(5, "Anthropic launches Claude Opus 5.5, cheaper and faster than predecessor",
+            "Anthropic released a new model it says is faster and cheaper than the one before.", 7))),
+    ),
+)
+
 private val news = News(
     built = hoursAgo(0),
     tabs = listOf("Zwolle", "Overijssel", "NL", "EU", "US", "Global"),
@@ -61,6 +77,7 @@ private val news = News(
         Feed("AD", "https://x", 30, null),
         Feed("BBC News", "https://x", 42, null),
     ),
+    report = report,
 )
 
 @PreviewTest
@@ -70,7 +87,7 @@ private val news = News(
 fun StoriesPreview() {
     NewsTheme {
         StoriesScreen(news, loading = false, error = null, tab = "All", listState = LazyListState(),
-            onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onServer = {})
+            onTab = {}, onRefresh = {}, onOpen = {}, onReport = {}, onFeeds = {}, onServer = {})
     }
 }
 
@@ -81,7 +98,7 @@ fun StoriesPreview() {
 fun StoriesOfflinePreview() {
     NewsTheme {
         StoriesScreen(news, loading = false, error = "Can't find http://newsbox:8080. Is Tailscale on?", tab = "Zwolle",
-            listState = LazyListState(), onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onServer = {})
+            listState = LazyListState(), onTab = {}, onRefresh = {}, onOpen = {}, onReport = {}, onFeeds = {}, onServer = {})
     }
 }
 
@@ -91,6 +108,14 @@ fun StoriesOfflinePreview() {
 @Composable
 fun StoryPreview() {
     NewsTheme { StoryScreen(iran, onBack = {}) }
+}
+
+@PreviewTest
+@Preview(name = "light", widthDp = 400, heightDp = 860)
+@Preview(name = "dark", widthDp = 400, heightDp = 860, uiMode = UI_MODE_NIGHT_YES)
+@Composable
+fun ReportPreview() {
+    NewsTheme { ReportScreen(report, onOpen = {}, onBack = {}) }
 }
 
 @PreviewTest

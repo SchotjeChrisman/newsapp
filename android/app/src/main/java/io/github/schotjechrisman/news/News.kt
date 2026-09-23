@@ -4,6 +4,7 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.time.Instant
+import java.time.LocalDate
 import java.time.OffsetDateTime
 import org.json.JSONArray
 import org.json.JSONObject
@@ -44,13 +45,29 @@ data class Story(
 
 data class Feed(val name: String, val url: String, val items: Int, val error: String?)
 
-data class News(val built: Instant, val tabs: List<String>, val stories: List<Story>, val feeds: List<Feed>)
+/** The S&P 500's last close; change is in percent. */
+data class Market(val name: String, val close: Double, val change: Double, val date: LocalDate)
 
-/** The server's whole news document. HttpURLConnection asks for gzip and unpacks it by itself. */
-fun download(server: String): String {
-    val connection = URL("${server.trimEnd('/')}/api/stories").openConnection() as HttpURLConnection
-    connection.connectTimeout = 15_000
-    connection.readTimeout = 60_000
+data class ReportStory(val id: Long, val headline: String, val gist: String, val sources: Int)
+
+data class Section(val title: String, val stories: List<ReportStory>)
+
+data class Report(val day: LocalDate, val market: Market?, val sections: List<Section>)
+
+data class News(
+    val built: Instant,
+    val tabs: List<String>,
+    val stories: List<Story>,
+    val feeds: List<Feed>,
+    val report: Report?,
+)
+
+/** A document from the server: the whole news (/api/stories) or the morning report (/api/report).
+ *  HttpURLConnection asks for gzip and unpacks it by itself. */
+fun download(server: String, path: String = "/api/stories", timeout: Int = 60_000): String {
+    val connection = URL("${server.trimEnd('/')}$path").openConnection() as HttpURLConnection
+    connection.connectTimeout = minOf(15_000, timeout)
+    connection.readTimeout = timeout
     try {
         if (connection.responseCode != 200) throw IOException("the server answered ${connection.responseCode}")
         return connection.inputStream.bufferedReader().use { it.readText() }
@@ -96,8 +113,24 @@ fun parse(json: String): News {
         feeds = root.getJSONArray("feeds").objects().map {
             Feed(it.getString("name"), it.getString("url"), it.optInt("items"), it.text("error"))
         },
+        report = root.optJSONObject("report")?.let(::report),
     )
 }
+
+/** The morning report, from /api/report or inside the news document; null before the first report. */
+fun parseReport(json: String): Report? = if (json.trim() == "null") null else report(JSONObject(json))
+
+private fun report(r: JSONObject) = Report(
+    day = LocalDate.parse(r.getString("day")),
+    market = r.optJSONObject("market")?.let {
+        Market(it.getString("name"), it.getDouble("close"), it.getDouble("change"), LocalDate.parse(it.getString("date")))
+    },
+    sections = r.getJSONArray("sections").objects().map { section ->
+        Section(section.getString("title"), section.getJSONArray("stories").objects().map {
+            ReportStory(it.getLong("id"), it.getString("headline"), it.getString("gist"), it.getInt("sources"))
+        })
+    },
+)
 
 private fun time(iso: String): Instant = OffsetDateTime.parse(iso).toInstant()
 
