@@ -122,6 +122,7 @@ private val clockFormat = DateTimeFormatter.ofPattern("EEE HH:mm", Locale.ENGLIS
 private val shortDay = DateTimeFormatter.ofPattern("EEE d MMM", Locale.ENGLISH)
 private val longDay = DateTimeFormatter.ofPattern("EEEE d MMMM", Locale.ENGLISH)
 private val weekday = DateTimeFormatter.ofPattern("EEE", Locale.ENGLISH)
+private val dateFormat = DateTimeFormatter.ofPattern("d MMM yyyy", Locale.ENGLISH)
 
 fun clock(t: Instant): String = clockFormat.format(t.atZone(ZoneId.systemDefault()))
 
@@ -130,7 +131,8 @@ fun ago(t: Instant): String {
     return when {
         minutes < 60 -> "$minutes min ago"
         minutes < 48 * 60 -> "${minutes / 60} h ago"
-        else -> "${minutes / (24 * 60)} d ago"
+        minutes < 7 * 24 * 60 -> "${minutes / (24 * 60)} d ago"
+        else -> dateFormat.format(t.atZone(ZoneId.systemDefault()))
     }
 }
 

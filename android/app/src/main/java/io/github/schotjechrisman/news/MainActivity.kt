@@ -65,6 +65,7 @@ class NewsState(context: Context) {
     private val prefs = context.getSharedPreferences("news", Context.MODE_PRIVATE)
     private val cache = File(context.filesDir, "news.json")
     private var fetched = 0L
+    private var searches = 0
 
     var server by mutableStateOf(prefs.getString("server", "") ?: "")
         private set
@@ -89,6 +90,7 @@ class NewsState(context: Context) {
         server = if ("://" in trimmed) trimmed else "http://$trimmed"
         prefs.edit().putString("server", server).apply()
         fetched = 0
+        results = null
     }
 
     suspend fun refresh(staleAfterMinutes: Long = 0) {
@@ -124,18 +126,20 @@ class NewsState(context: Context) {
     suspend fun search(query: String) {
         if (query.isBlank() || server.isBlank()) return
         val from = server
+        val mine = ++searches  // an answer to an earlier search that arrives later is dropped
         searching = true
         searchError = null
         try {
-            results = withContext(Dispatchers.IO) {
+            val found = withContext(Dispatchers.IO) {
                 parseSearch(download(from, "/api/search?q=" + URLEncoder.encode(query.trim(), "UTF-8"), timeout = 20_000))
             }
+            if (mine == searches) results = found
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            searchError = explain(e, from)
+            if (mine == searches) searchError = explain(e, from)
         } finally {
-            searching = false
+            if (mine == searches) searching = false
         }
     }
 
