@@ -127,7 +127,7 @@ fun ago(t: Instant): String {
     }
 }
 
-private fun plural(n: Int, word: String, words: String = "${word}s") = if (n == 1) "1 $word" else "$n $words"
+fun plural(n: Int, word: String, words: String = "${word}s") = if (n == 1) "1 $word" else "$n $words"
 
 @Composable
 private fun rememberOpener(): (String) -> Unit {

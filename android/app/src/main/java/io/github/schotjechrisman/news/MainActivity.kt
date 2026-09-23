@@ -40,7 +40,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        state.openReport = intent.getBooleanExtra(MorningReport.OPEN, false)
+        if (savedInstanceState == null) state.openReport = intent.getBooleanExtra(MorningReport.OPEN, false)
         MorningReport.ensure(this)
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             askToNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -141,7 +141,9 @@ fun App(state: NewsState) {
         state.openReport = false
         if (state.server.isNotBlank()) {
             screen = Screen.Report
-            state.refresh()  // the last download may be from before the report was built
+            // The last download may be from before the report was built. Launched outside this effect, which ends as
+            // soon as openReport is reset.
+            scope.launch { state.refresh() }
         }
     }
 

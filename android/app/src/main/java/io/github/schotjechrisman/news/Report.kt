@@ -96,7 +96,7 @@ object MorningReport {
             builder.setContentText(problem)
         } else {
             val headlines = report.sections.flatMap { it.stories }.map { it.headline }
-            builder.setContentText(listOfNotNull(report.market?.let(::marketLine), if (headlines.size == 1) "1 story" else "${headlines.size} stories").joinToString(" · "))
+            builder.setContentText(listOfNotNull(report.market?.let(::marketLine), plural(headlines.size, "story", "stories")).joinToString(" · "))
             builder.setStyle(Notification.InboxStyle().also { style -> headlines.take(5).forEach { style.addLine(it) } })
         }
         manager.notify(1, builder.build())
