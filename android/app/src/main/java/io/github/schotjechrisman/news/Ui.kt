@@ -966,8 +966,9 @@ fun InterestsScreen(places: List<Place>, interests: List<Interest>, onBack: () -
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp, 0.dp, 16.dp, 16.dp)) {
             item {
                 Hint(
-                    "Each one is a tab and a part of the morning report. Claude files a new story under the most specific " +
-                        "place it's about, and sorts stories into the subjects by their descriptions.",
+                    "Claude files a new story under the most specific place it's about, and sorts stories into the " +
+                        "subjects by their descriptions. News from other places stays out, unless 30 outlets cover it, or " +
+                        "5 and it fits a subject. Each subject is a tab, and both are part of the morning report.",
                     Modifier.padding(4.dp, 4.dp, 4.dp, 4.dp),
                 )
             }
