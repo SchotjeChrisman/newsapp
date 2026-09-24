@@ -36,6 +36,9 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -276,7 +279,7 @@ fun StoriesScreen(
     loading: Boolean,
     error: String?,
     tab: String,
-    listState: LazyListState,
+    listState: (String) -> LazyListState,
     barState: TopAppBarState,
     onTab: (String) -> Unit,
     onRefresh: () -> Unit,
@@ -287,6 +290,7 @@ fun StoriesScreen(
     bottomBar: @Composable () -> Unit,
 ) {
     var menu by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     val scroll = titleScroll(barState)
     Scaffold(
         topBar = {
@@ -307,32 +311,42 @@ fun StoriesScreen(
                 return@PullToRefreshBox
             }
             val tabs = listOf("All") + news.tabs
-            // The All list comes in the server's order, which lifts every subject's notable stories; a tab's own list
-            // lifts only its own, the same way.
-            val shown = remember(news, tab) {
-                val top = news.stories.maxOfOrNull { it.coverage }?.takeIf { it > 0 } ?: 1.0
-                if (tab == "All") news.stories
-                else news.stories.filter { tab in it.tabs }
-                    .sortedWith(compareByDescending<Story> { maxOf(it.coverage / top, it.lift[tab] ?: 0.0) }.thenByDescending { it.coverage })
-            }
-            // The title is closer to the list than pull-to-refresh: a pull first opens the title, then refreshes.
-            LazyColumn(
-                state = listState,
-                contentPadding = PaddingValues(bottom = 16.dp),
-                modifier = Modifier.fillMaxSize().nestedScroll(scroll.nestedScrollConnection),
-            ) {
-                stickyHeader { TabChips(tabs, tab, onTab) }
-                if (error != null) item { Banner(error, Modifier.padding(16.dp, 4.dp)) }
-                items(shown, key = { it.id }) { story ->
-                    StoryCard(story, Modifier.padding(16.dp, 5.dp)) { onOpen(story) }
-                }
-                item {
-                    Text(
-                        if (shown.isEmpty()) "No stories here in the last two days." else "Updated ${clock(news.built)}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(20.dp, 16.dp),
-                    )
+            val pager = rememberPagerState(tabs.indexOf(tab).coerceAtLeast(0)) { tabs.size }
+            // The pager alone moves between tabs: a tapped chip turns the page, and the tab follows the page it settles on.
+            LaunchedEffect(pager.settledPage) { tabs.getOrNull(pager.settledPage)?.let(onTab) }
+            // New tabs shift the pages, so the pager goes back to the tab's page (All once the tab is gone).
+            LaunchedEffect(tabs) { pager.scrollToPage(tabs.indexOf(tab).coerceAtLeast(0)) }
+            Column {
+                TabChips(tabs, tabs.getOrElse(pager.targetPage) { "All" }) { scope.launch { pager.animateScrollToPage(tabs.indexOf(it)) } }
+                HorizontalPager(pager, Modifier.weight(1f)) { page ->
+                    val t = tabs[page]
+                    // The All list comes in the server's order, which lifts every subject's notable stories; a tab's own
+                    // list lifts only its own, the same way.
+                    val shown = remember(news, t) {
+                        val top = news.stories.maxOfOrNull { it.coverage }?.takeIf { it > 0 } ?: 1.0
+                        if (t == "All") news.stories
+                        else news.stories.filter { t in it.tabs }
+                            .sortedWith(compareByDescending<Story> { maxOf(it.coverage / top, it.lift[t] ?: 0.0) }.thenByDescending { it.coverage })
+                    }
+                    // The title is closer to the list than pull-to-refresh: a pull first opens the title, then refreshes.
+                    LazyColumn(
+                        state = listState(t),
+                        contentPadding = PaddingValues(bottom = 16.dp),
+                        modifier = Modifier.fillMaxSize().nestedScroll(scroll.nestedScrollConnection),
+                    ) {
+                        if (error != null) item { Banner(error, Modifier.padding(16.dp, 4.dp)) }
+                        items(shown, key = { it.id }) { story ->
+                            StoryCard(story, Modifier.padding(16.dp, 5.dp)) { onOpen(story) }
+                        }
+                        item {
+                            Text(
+                                if (shown.isEmpty()) "No stories here in the last two days." else "Updated ${clock(news.built)}",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(20.dp, 16.dp),
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -341,7 +355,12 @@ fun StoriesScreen(
 
 @Composable
 private fun TabChips(tabs: List<String>, tab: String, onTab: (String) -> Unit) {
+    // The chip before the chosen one leads the row, so a swipe to a tab past the edge brings its chip into sight.
+    val first = (tabs.indexOf(tab) - 1).coerceAtLeast(0)
+    val row = rememberLazyListState(first)
+    LaunchedEffect(first) { row.animateScrollToItem(first) }
     LazyRow(
+        state = row,
         modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface),
         contentPadding = PaddingValues(16.dp, 4.dp, 16.dp, 8.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),

@@ -287,7 +287,7 @@ fun App(state: NewsState) {
                     loading = state.loading,
                     error = state.error,
                     tab = shownTab,
-                    listState = lists.getOrPut(shownTab) { LazyListState() },
+                    listState = { lists.getOrPut(it) { LazyListState() } },
                     barState = newsBar,
                     onTab = { tab = it },
                     onRefresh = { scope.launch { state.refresh() } },

@@ -96,7 +96,7 @@ private val news = News(
 @Composable
 fun StoriesPreview() {
     NewsTheme {
-        StoriesScreen(news, loading = false, error = null, tab = "All", listState = LazyListState(), barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f),
+        StoriesScreen(news, loading = false, error = null, tab = "All", listState = { LazyListState() }, barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f),
             onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onSettings = {}, onServer = {},
             bottomBar = { NavBar(Screen.Stories) {} })
     }
@@ -110,7 +110,7 @@ fun StoriesLandscapePreview() {
         Row(Modifier.fillMaxSize()) {
             NavRail(Screen.Stories) {}
             Box(Modifier.weight(1f)) {
-                StoriesScreen(news, loading = false, error = null, tab = "All", listState = LazyListState(),
+                StoriesScreen(news, loading = false, error = null, tab = "All", listState = { LazyListState() },
                     barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f), onTab = {}, onRefresh = {}, onOpen = {},
                     onFeeds = {}, onSettings = {}, onServer = {}, bottomBar = {})
             }
@@ -125,7 +125,7 @@ fun StoriesLandscapePreview() {
 fun StoriesOfflinePreview() {
     NewsTheme {
         StoriesScreen(news, loading = false, error = "Can't find http://newsbox:8080. Is Tailscale on?", tab = "Zwolle",
-            listState = LazyListState(), barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f), onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onSettings = {}, onServer = {},
+            listState = { LazyListState() }, barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f), onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onSettings = {}, onServer = {},
             bottomBar = { NavBar(Screen.Stories) {} })
     }
 }
