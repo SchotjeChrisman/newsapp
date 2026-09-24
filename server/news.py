@@ -58,21 +58,29 @@ FADE = timedelta(hours=12)
 # those the lift at least doubles.
 NOTABLE_TOP = 3
 NOTABLE_LIFT = 0.4
+# The writer files a story about a place the reader doesn't follow as Elsewhere. The app leaves those out, unless
+# ELSEWHERE_SOURCES independent sources cover one, or ELSEWHERE_SUBJECT_SOURCES and it fits a subject.
+ELSEWHERE = "Elsewhere"
+ELSEWHERE_SOURCES = 30
+ELSEWHERE_SUBJECT_SOURCES = 5
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
 OPINION = re.compile(r"/(columns?-opinie|opinie|opinions?|columns?|commentisfree|commentary)/", re.I)
 # Google News links hide the section, so its opinion pieces are recognized by the label in the headline.
 OPINION_TITLE = re.compile(r"^(opinion|opinie|column)\s*[|:]|\|\s*(opinion|opinie|column)\s*$", re.I)
 TAG = re.compile(r"<[^>]+>")
-# The places, each a tab and a part of the morning report: what belongs in it (the writer files a story under the most
-# specific place it's about), and how many independent sources make a story major enough for the report. The feeds in
-# sources.toml are grouped by these names. The app's settings can change them, like the interests below.
+# The places the reader follows, each a part of the morning report: what belongs in it (the writer files a story under
+# the most specific place it's about, or Elsewhere), and how many independent sources make a story major enough for the
+# report. The feeds in sources.toml are grouped by these names. The app's settings can change them, like the interests
+# below.
 PLACES = {
     "Zwolle": {"about": "the city of Zwolle", "major": 2},
     "Overijssel": {"about": "the province of Overijssel outside Zwolle", "major": 2},
     "NL": {"about": "the Netherlands outside Overijssel, or the country as a whole", "major": 5},
-    "EU": {"about": "EU institutions, or European countries other than the Netherlands", "major": 6},
+    "EU": {"about": "the EU's institutions and politics, and news from other European countries that matters beyond their "
+                    "borders", "major": 6},
     "US": {"about": "the United States", "major": 8},
-    "Global": {"about": "anywhere else, or the world as a whole", "major": 10},
+    "Global": {"about": "world news that matters beyond the country it happens in: wars, diplomacy, disasters, major "
+                        "elections", "major": 10},
 }
 REGIONS = list(PLACES)
 DUTCH_REGIONS = {"Zwolle", "Overijssel", "NL"}  # sources there write Dutch unless sources.toml says otherwise
@@ -552,8 +560,8 @@ possibly in Dutch. For every story write:
 - headline: neutral and factual, at most 14 words.
 - summary: what happened, as far as the articles tell it. One sentence when they give little more than a headline;
   never more than 4 sentences or 90 words. Short beats padded.
-- region: the most specific place the story is about, from the places below, or None when it is about no place (a
-  product launch, a study, an album)."""
+- region: the most specific place the story is about, from the places below. Elsewhere when it is about a place none
+  of them covers; the reader doesn't follow it. None when it is about no place (a product launch, a study, an album)."""
 
 UPDATE_PROMPT = """You keep a running story in a private news app up to date. You get its current text (headline,
 summary, earlier updates) and new articles. For each new article that states something the current text doesn't have
@@ -606,7 +614,7 @@ SCHEMAS = {
     "new": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
         "type": "object", "required": ["key", "headline", "summary", "region"],
         "properties": {"key": {"type": "string"}, "headline": {"type": "string"}, "summary": {"type": "string"},
-                       "region": {"enum": REGIONS + ["None"]}, "quotes": QUOTES_SCHEMA}}}}},
+                       "region": {"enum": REGIONS + [ELSEWHERE, "None"]}, "quotes": QUOTES_SCHEMA}}}}},
     "update": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
         "type": "object", "required": ["key", "facts"],
         "properties": {"key": {"type": "string"}, "quotes": QUOTES_SCHEMA, "facts": {"type": "array", "items": {
@@ -636,7 +644,7 @@ def reply_schema(db, kind):
     """What Claude Code checks a reply against; the places and interests can change, so their names go in here."""
     if kind == "new":
         schema = copy.deepcopy(SCHEMAS["new"])
-        schema["properties"]["stories"]["items"]["properties"]["region"] = {"enum": list(places(db)) + ["None"]}
+        schema["properties"]["stories"]["items"]["properties"]["region"] = {"enum": list(places(db)) + [ELSEWHERE, "None"]}
         return schema
     if kind != "tag":
         return SCHEMAS[kind]
@@ -780,7 +788,8 @@ def write(db):
                         headline, summary = str(item.get("headline") or "").strip(), str(item.get("summary") or "").strip()
                         if not headline or not summary:
                             continue
-                        region = item.get("region") if isinstance(item.get("region"), str) and item["region"] in known else None
+                        region = item.get("region")
+                        region = region if isinstance(region, str) and region in [*known, ELSEWHERE] else None
                         db.execute("UPDATE stories SET headline = ?, summary = ?, region = ?, summary_articles = ? WHERE id = ?",
                                    (headline, summary, region, json.dumps(st["ids"]), st["id"]))
                         written += 1
@@ -924,12 +933,15 @@ def morning(db, t=None):
         return
     # Local midnight arithmetic, so a night with a clock change still starts the window at REPORT_HOUR.
     since = iso(datetime.combine(end.date() - timedelta(days=1), clock(REPORT_HOUR)).astimezone())
-    stories = [s for s in shown(db) if s["headline"] and any(a[5] >= since for a in s["arts"])]
+    stories = [s for s in shown(db) if s["headline"] and followed(s) and any(a[5] >= since for a in s["arts"])]
     sections, picked = [], set()
     for region, place in places(db).items():
         major = [s for s in stories if region in s["regions"] and s["sources"] >= place["major"]][:REPORT_PER_REGION]
         sections.append((region, major))
         picked |= {s["id"] for s in major}
+    big = [s for s in stories if s["regions"] == [ELSEWHERE] and s["sources"] >= ELSEWHERE_SOURCES][:REPORT_PER_REGION]
+    sections.append((ELSEWHERE, big))
+    picked |= {s["id"] for s in big}
     for interest in interests(db):
         top = [s for s in stories if interest in s["interests"] and s["id"] not in picked][:REPORT_PER_INTEREST]
         sections.append((interest, top))
@@ -1019,6 +1031,12 @@ def ranked(db, stories):
         return max([s["coverage"] / top, *lifts]), s["coverage"]
 
     return sorted(stories, key=key, reverse=True)
+
+
+def followed(s):
+    """Whether the app lists a story: not when it is minor news from a place the reader doesn't follow."""
+    return (s["regions"] != [ELSEWHERE] or s["sources"] >= ELSEWHERE_SOURCES
+            or bool(s["interests"]) and s["sources"] >= ELSEWHERE_SUBJECT_SOURCES)
 
 
 def lean_counts(pairs, lean):
@@ -1310,13 +1328,13 @@ def search(db, query, most=100):
 
 
 def api(db):
-    """Everything the app shows in one document: the stories on the check page, in the app's order, and the feed
-    status."""
+    """Everything the app shows in one document: the stories on the check page the reader follows, in the app's order,
+    and the feed status. The places aren't tabs: they decide which stories come."""
     lean = leans(db)
-    stories = [story_json(s, lean) for s in ranked(db, shown(db))]
+    stories = [story_json(s, lean) for s in ranked(db, [s for s in shown(db) if followed(s)])]
     feeds = [{"name": name, "url": url, "items": items, "error": error, "checked": checked} for name, url, items, error, checked
              in db.execute("SELECT name, url, items, error, checked FROM sources ORDER BY error IS NULL, name")]
-    return {"built": iso(now()), "tabs": list(places(db)) + list(interests(db)), "stories": stories, "feeds": feeds,
+    return {"built": iso(now()), "tabs": list(interests(db)), "stories": stories, "feeds": feeds,
             "report": latest_report(db)}
 
 
@@ -1382,8 +1400,9 @@ def save_settings(db, changes):
             found[name] = about
         new["interests"] = found
     # tag() matches the model's answers on letters and digits only, and no two tabs can have the same name. All is the
-    # app's first tab, None the writer's answer for no place, and Topics the feeds without one.
-    tabs = ["All", "None", "Topics"] + list(new.get("places", where)) + list(new.get("interests", before))
+    # app's first tab, None and Elsewhere the writer's answers for no place and one the reader doesn't follow, and
+    # Topics the feeds without one.
+    tabs = ["All", "None", ELSEWHERE, "Topics"] + list(new.get("places", where)) + list(new.get("interests", before))
     taken = set()
     for tab in tabs if "places" in changes or "interests" in changes else []:
         if fold(tab) in taken:

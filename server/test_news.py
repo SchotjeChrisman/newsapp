@@ -306,7 +306,7 @@ def test_write():
     assert [a["outlet"] for a in story["summary_from"]] == ["NOS", "BBC", "Trouw", "Tubantia"]
     assert [(a["outlet"], a["lean"], a["opinion"]) for a in story["articles"][:3]] == [
         ("NOS", "center", False), ("BBC", None, False), ("Trouw", "left", True)]
-    assert data["tabs"] == news.REGIONS + list(news.INTERESTS)
+    assert data["tabs"] == list(news.INTERESTS), "the places aren't tabs"
 
     add_article(db, 7, 1, "AD", "Kabinet valt, koning aanvaardt ontslag", lang="nl")
     for reply in ({"stories": [{"key": ["s1"]}, "junk", {"key": "s1", "facts": [["a1"], {"article": ["a1"], "fact": "y"},
@@ -462,7 +462,7 @@ def test_tag():
     assert db.execute("SELECT interests FROM stories WHERE id = 1").fetchone() == ('["Football"]',), \
         "Mistral takes over when a Claude request fails"
     data = news.api(db)
-    assert data["tabs"] == news.REGIONS + list(news.INTERESTS)
+    assert data["tabs"] == list(news.INTERESTS), "the places aren't tabs"
     assert {st["id"]: st["tabs"] for st in data["stories"]}[2] == ["AI", "S&P 500"]
 
     def renamed_meanwhile(model, system, payload, max_tokens):
@@ -516,7 +516,9 @@ def test_morning():
                                              (2, "NL", ["Football"], ["NOS", "AD"]),
                                              (3, "Zwolle", [], ["De Stentor", "1Zwolle"]),
                                              (4, "US", ["AI"], ["CNN", "Fox News", "NPR"]),
-                                             (5, "Global", [], [f"Outlet {i}" for i in range(12)])):
+                                             (5, "Global", [], [f"Outlet {i}" for i in range(12)]),
+                                             (6, "Elsewhere", ["AI"], ["BBC", "DW"]),
+                                             (7, "Elsewhere", [], [f"Outlet {i}" for i in range(30)])):
         db.execute("INSERT INTO stories(id, updated, n, headline, summary, region, interests) VALUES (?,?,?,?,?,?,?)",
                    (sid, t, len(outlets), f"Headline {sid}", f"Story number {sid} happened today. Then more.", region,
                     json.dumps(interests)))
@@ -529,8 +531,8 @@ def test_morning():
     report = news.latest_report(db)
     assert report["day"] == "2026-09-23" and report["market"]["change"] == -0.5
     assert [(sec["title"], [st["id"] for st in sec["stories"]]) for sec in report["sections"]] == [
-        ("Zwolle", [3]), ("NL", [1]), ("AI", [4]), ("Football", [2])], \
-        "major stories per region, then interests; old news and small stories stay out"
+        ("Zwolle", [3]), ("NL", [1]), ("Elsewhere", [7]), ("AI", [4]), ("Football", [2])], \
+        "major stories per region, then interests; old news, small stories and minor ones from elsewhere stay out"
     assert report["sections"][1]["stories"][0] == {"id": 1, "headline": "Headline 1", "gist": "Story number 1 happened today.",
                                                   "sources": 6}, "without a writer the gist is the summary's first sentence"
     news.morning(db, fixed.astimezone())
@@ -606,6 +608,25 @@ def test_search():
     db.execute("DELETE FROM search_index")
     news.index(db)
     assert [st["id"] for st in news.search(db, "mbappe")] == [1], "accents don't matter"
+
+
+def test_elsewhere():
+    os.environ["MISTRAL_API_KEY"] = "test"
+    db = news.connect()
+    for sid, sources, subjects in ((1, 1, []), (2, 29, []), (3, 30, []), (4, 4, ["Football"]), (5, 5, ["Football"])):
+        db.execute("INSERT INTO stories(id, updated, n, interests) VALUES (?, ?, ?, ?)",
+                   (sid, news.iso(news.now()), sources, json.dumps(subjects)))
+        for i in range(sources):
+            add_article(db, sid * 100 + i, sid, f"Outlet {i}", f"Story {sid} from outlet {i}")
+    news.call_mistral = lambda model, system, payload, max_tokens: (json.dumps({"stories": [
+        {"key": st["key"], "headline": "H", "summary": "S", "region": "Elsewhere"} for st in payload["stories"]]}), (10, 10))
+    news.write(db)
+    assert db.execute("SELECT DISTINCT region FROM stories").fetchall() == [("Elsewhere",)]
+    assert sorted(s["id"] for s in news.api(db)["stories"]) == [3, 5], \
+        "from a place the reader doesn't follow, only what 30 sources cover, or 5 and it fits a subject"
+    db.execute("UPDATE stories SET region = NULL WHERE id = 1")
+    assert sorted(s["id"] for s in news.api(db)["stories"]) == [1, 3, 5], "a story about no place stays"
+    del os.environ["MISTRAL_API_KEY"]
 
 
 def test_order():
@@ -688,7 +709,7 @@ def test_settings():
     t = news.iso(news.now())
     db.execute("INSERT INTO stories(id, updated, n, headline, interests) VALUES (1, ?, 1, 'H', '[\"AI\"]')", (t,))
     assert news.save_settings(db, {"interests": [{"name": "Politics", "about": "elections and governments"}]}) is True
-    assert news.api(db)["tabs"] == news.REGIONS + ["Politics"]
+    assert news.api(db)["tabs"] == ["Politics"]
     assert "- Politics: elections and governments" in news.system_prompt(db, "tag")
     assert news.reply_schema(db, "tag")["properties"]["stories"]["items"]["properties"]["interests"]["items"]["enum"] == ["Politics"]
     assert db.execute("SELECT interests FROM stories").fetchone() == (None,), "recent stories are sorted again"
@@ -711,7 +732,7 @@ def test_settings():
     edited[1] |= {"name": "Netherlands"}
     edited.append({"name": "Deventer", "about": "the city of Deventer", "major": 2, "was": None})
     assert news.save_settings(db, {"places": edited}) is False
-    assert news.api(db)["tabs"][:6] == ["Zwolle", "Netherlands", "EU", "US", "Global", "Deventer"]
+    assert [p["name"] for p in news.settings_json(db)["places"]] == ["Zwolle", "Netherlands", "EU", "US", "Global", "Deventer"]
     regions = {s["url"]: s["region"] for s in news.load_sources(db)[0]}
     bundled = {s["url"]: s["region"] for s in news.load_sources()[0]}
     assert {regions[u] for u, r in bundled.items() if r == "NL" and u in regions} == {"Netherlands"}, "a renamed place keeps its feeds"
@@ -722,7 +743,7 @@ def test_settings():
     assert db.execute("SELECT region FROM articles WHERE id = 30").fetchone() == ("Netherlands",)
     assert "- Deventer: the city of Deventer" in news.system_prompt(db, "new")
     assert news.reply_schema(db, "new")["properties"]["stories"]["items"]["properties"]["region"]["enum"] == [
-        "Zwolle", "Netherlands", "EU", "US", "Global", "Deventer", "None"]
+        "Zwolle", "Netherlands", "EU", "US", "Global", "Deventer", "Elsewhere", "None"]
     feeds = news.settings_json(db)["sources"]
     news.save_settings(db, {"sources": feeds})
     assert news.setting(db, "sources", None)["removed"] == ["https://www.geenstijl.nl/feeds/recent.atom"], \
@@ -740,6 +761,7 @@ def test_settings():
         "a new place with an old name doesn't take the feeds that moved"
     current = [p | {"was": p["name"]} for p in news.settings_json(db)["places"]]
     for bad in ({"places": current + [{"name": "Topics", "about": "x", "major": 1, "was": None}]},
+                {"places": current + [{"name": "elsewhere", "about": "x", "major": 1, "was": None}]},
                 {"places": current + [{"name": "ai", "about": "x", "major": 1, "was": None}]},
                 {"places": [current[0] | {"major": 0}]}, {"places": [current[0] | {"major": 2.5}]},
                 {"places": [current[0] | {"was": "Mars"}]}, {"places": [current[0], current[0] | {"name": "Z2"}]},
@@ -843,6 +865,7 @@ test_tag()
 test_notable()
 test_morning()
 test_search()
+test_elsewhere()
 test_order()
 test_settings()
 test_http()
