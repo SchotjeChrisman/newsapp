@@ -307,8 +307,14 @@ fun StoriesScreen(
                 return@PullToRefreshBox
             }
             val tabs = listOf("All") + news.tabs
-            val shown = remember(news, tab) { news.stories.filter { tab == "All" || tab in it.tabs } }
-            val firstSingle = shown.indexOfFirst { it.sources < 2 }
+            // The All list comes in the server's order, which lifts every subject's notable stories; a tab's own list
+            // lifts only its own, the same way.
+            val shown = remember(news, tab) {
+                val top = news.stories.maxOfOrNull { it.coverage }?.takeIf { it > 0 } ?: 1.0
+                if (tab == "All") news.stories
+                else news.stories.filter { tab in it.tabs }
+                    .sortedWith(compareByDescending<Story> { maxOf(it.coverage / top, it.lift[tab] ?: 0.0) }.thenByDescending { it.coverage })
+            }
             // The title is closer to the list than pull-to-refresh: a pull first opens the title, then refreshes.
             LazyColumn(
                 state = listState,
@@ -317,8 +323,7 @@ fun StoriesScreen(
             ) {
                 stickyHeader { TabChips(tabs, tab, onTab) }
                 if (error != null) item { Banner(error, Modifier.padding(16.dp, 4.dp)) }
-                itemsIndexed(shown, key = { _, s -> s.id }) { i, story ->
-                    if (i == firstSingle) SectionLabel("Reported by one source", Modifier.padding(start = 20.dp, top = 20.dp, bottom = 6.dp))
+                items(shown, key = { it.id }) { story ->
                     StoryCard(story, Modifier.padding(16.dp, 5.dp)) { onOpen(story) }
                 }
                 item {

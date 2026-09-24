@@ -478,6 +478,33 @@ def test_tag():
     del os.environ["MISTRAL_API_KEY"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
 
 
+def test_notable():
+    originals = news.call_claude, news.call_mistral
+    os.environ["MISTRAL_API_KEY"] = "test"
+    db = news.connect()
+    t = news.iso(news.now())
+    db.execute("INSERT INTO stories(id, updated, n, headline, summary, interests) VALUES (1, ?, 1, 'New model', 'S', '[\"AI\"]'),"
+               " (2, ?, 1, 'Road works', 'S', NULL), (3, ?, 1, 'Old', 'S', '[]'), (4, ?, 1, 'A how-to', 'S', NULL)", (t,) * 4)
+    sent = []
+
+    def fake(model, system, payload, max_tokens):
+        sent.append([st["headline"] for st in payload["stories"]])
+        return json.dumps({"stories": [{"key": "s1", "interests": ["AI"], "notable": True},
+                                       {"key": "s2", "interests": [], "notable": True},
+                                       {"key": "s3", "interests": ["AI"], "notable": False}]}), (10, 10)
+
+    news.call_mistral = fake
+    news.tag(db)
+    assert sent == [["New model", "Road works", "A how-to"]], "stories sorted before notable existed are sent once more"
+    assert db.execute("SELECT id, interests, notable FROM stories ORDER BY id").fetchall() == [
+        (1, '["AI"]', 1), (2, "[]", 0), (3, "[]", None), (4, '["AI"]', 0)], "a story without an interest is never notable"
+    news.tag(db)
+    assert len(sent) == 1, "each story once"
+    assert news.reply_schema(db, "tag")["properties"]["stories"]["items"]["required"] == ["key", "interests", "notable"]
+    news.call_claude, news.call_mistral = originals
+    del os.environ["MISTRAL_API_KEY"]
+
+
 def test_morning():
     originals = news.now, news.market, news.call_mistral
     fixed = datetime(2026, 9, 23, 3, 30, tzinfo=UTC)
@@ -579,6 +606,47 @@ def test_search():
     db.execute("DELETE FROM search_index")
     news.index(db)
     assert [st["id"] for st in news.search(db, "mbappe")] == [1], "accents don't matter"
+
+
+def test_order():
+    db = news.connect()
+    t = news.iso(news.now())
+    db.execute("INSERT INTO stories(id, updated, n) VALUES (1, ?, 6), (5, ?, 2), (7, ?, 3)", (t,) * 3)
+    for i, outlet in enumerate(("NOS", "AD", "NRC", "Trouw", "BBC", "CNN")):
+        add_article(db, 10 + i, 1, outlet, f"Yesterday's big story {i}", age=timedelta(hours=26))
+    add_article(db, 16, 1, "NOS", "A late follow-up", age=timedelta(hours=1))
+    add_article(db, 50, 5, "AD", "One article, two papers", age=timedelta(hours=10))
+    add_article(db, 51, 5, "Tubantia", "One article, two papers", age=timedelta(hours=2))
+    for i, outlet in enumerate(("NOS", "AD", "BBC")):
+        add_article(db, 70 + i, 7, outlet, f"Breaking {i}")
+    data = news.api(db)
+    assert [s["id"] for s in data["stories"]] == [7, 1, 5], "today's news beats yesterday's bigger story"
+    assert data["stories"][0]["coverage"] > data["stories"][1]["coverage"] > 0, "the app orders a tab's list by it"
+    fade, shown = news.FADE / timedelta(hours=1), {s["id"]: s for s in news.shown(db)}
+    assert abs(news.weight(shown[1], news.now()) - (0.5 ** (1 / fade) + 5 * 0.5 ** (26 / fade))) < 0.01, \
+        "each outlet counts once, at its newest"
+    assert abs(news.weight(shown[5], news.now()) - 0.5 ** (2 / fade)) < 0.01, "copies count once, at the newest"
+
+    db = news.connect()
+    stories = {"G": (1, "Global", 20, 1, "AI", 1), "A": (2, "NL", 6, 1, None, 0), "B9": (3, "Global", 5, 1, "AI", 1),
+               "N3": (4, "Global", 3, 1, "AI", 1), "N2": (5, "Global", 2, 6, "AI", 1), "N1": (6, "Global", 1, 2, "AI", 1),
+               "N4": (7, "Global", 1, 3, "AI", 1), "N5": (8, "Global", 1, 5, "AI", 1), "F": (9, "NL", 2, 1, None, 0),
+               "R": (10, "Global", 1, 1, "AI", 0), "K": (11, "Global", 1, 2, "Knitting", 1)}
+    for sid, region, sources, hours, subject, notable in stories.values():
+        db.execute("INSERT INTO stories(id, updated, n, headline, summary, region, interests, notable) VALUES (?,?,?,?,?,?,?,?)",
+                   (sid, t, sources, f"H{sid}", "S", region, json.dumps([subject] if subject else []), notable))
+        for i in range(sources):
+            add_article(db, sid * 100 + i, sid, f"Outlet {i}", f"Story {sid} from outlet {i}", age=timedelta(hours=hours))
+    db.execute("UPDATE articles SET published = ? WHERE id = 400", (news.iso(news.now() - timedelta(hours=30)),))
+    names = {sid: name for name, (sid, *_) in stories.items()}
+    data = {names[s["id"]]: s for s in news.api(db)["stories"]}
+    assert list(data) == ["G", "N3", "N1", "N4", "A", "B9", "F", "N2", "R", "K", "N5"], \
+        "in All, a subject's three freshest notable stories that the lift at least doubles rise, also one three outlets " \
+        "cover; not a routine one, an older fourth, a bigger one that needs little, or one of a subject the settings no " \
+        "longer have"
+    assert data["N3"]["lift"] == {"AI": round(news.NOTABLE_LIFT * 0.5 ** (1 / fade), 3)}, "the lift fades from the newest article"
+    assert (data["G"]["lift"], set(data["B9"]["lift"]), set(data["N5"]["lift"]), data["K"]["lift"]) == ({}, {"AI"}, {"AI"}, {}), \
+        "a big notable story needs no lift; in the AI tab's own list, the others all rise"
 
 
 def test_settings():
@@ -772,8 +840,10 @@ test_mistral_articles()
 test_write()
 test_claude_writer()
 test_tag()
+test_notable()
 test_morning()
 test_search()
+test_order()
 test_settings()
 test_http()
 print("ok")

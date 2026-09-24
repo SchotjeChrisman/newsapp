@@ -50,6 +50,14 @@ YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=1d&inte
 # A story accepts articles published up to this long after its latest one; older feed items are skipped.
 OPEN_FOR = timedelta(hours=72)
 SHOW = timedelta(hours=48)
+# The app lists stories by how many outlets cover them now: each independent source counts half as much for every FADE
+# since its newest article on the story.
+FADE = timedelta(hours=12)
+# A subject's notable stories count as at least NOTABLE_LIFT times the biggest story's recent coverage in the subject's
+# own list, fading with their newest article like coverage does; in the All list, only its NOTABLE_TOP freshest of
+# those the lift at least doubles.
+NOTABLE_TOP = 3
+NOTABLE_LIFT = 0.4
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
 OPINION = re.compile(r"/(columns?-opinie|opinie|opinions?|columns?|commentisfree|commentary)/", re.I)
 # Google News links hide the section, so its opinion pieces are recognized by the label in the headline.
@@ -112,7 +120,8 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 """
 # Columns added after the first release; connect() adds them to older databases.
 COLUMNS = {"articles": ["lang TEXT", "title_en TEXT", "summary_en TEXT", "written INTEGER DEFAULT 0"],
-           "stories": ["headline TEXT", "summary TEXT", "region TEXT", "summary_articles TEXT", "interests TEXT"],
+           "stories": ["headline TEXT", "summary TEXT", "region TEXT", "summary_articles TEXT", "interests TEXT",
+                       "notable INTEGER"],
            "spend": ["claude_usd REAL DEFAULT 0"]}
 
 
@@ -555,7 +564,11 @@ add nothing new; most stories need one or two sentences, some none."""
 TAG_PROMPT = """You sort the stories of a private news app into the reader's interests. For each story, list the
 interests it is about, from the list below. A story can have several interests or none; most stories have none. Pick an
 interest only when the story itself is about it, not when it comes up in passing. Include every story, with an empty
-list when no interest fits, and refer to stories by their key exactly as given ("s1")."""
+list when no interest fits, and refer to stories by their key exactly as given ("s1").
+Also say whether each story is notable: true when someone who follows one of its interests closely would want to know
+about it even if only one outlet reports it, like a new AI model, a major launch, breach or ruling, or a big transfer or
+result; false for routine items like reviews, how-tos, deals, rumours, previews, opinion and minor updates, and for
+stories without an interest."""
 
 REPORT_PROMPT = """You write the morning report of a private news app. For each story write one plain English sentence of at
 most 18 words, two lines on a phone, that says what happened, including the latest update if there is one. Use only the given headline,
@@ -582,7 +595,7 @@ FORMATS = {
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}""",
     "update": """Return JSON: {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "..."}],
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}""",
-    "tag": 'Return JSON: {"stories": [{"key": "s1", "interests": ["AI", "Tech"]}]}',
+    "tag": 'Return JSON: {"stories": [{"key": "s1", "interests": ["AI", "Tech"], "notable": false}]}',
     "report": 'Return JSON: {"stories": [{"key": "s1", "gist": "..."}]}',
 }
 
@@ -628,8 +641,9 @@ def reply_schema(db, kind):
     if kind != "tag":
         return SCHEMAS[kind]
     return {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
-        "type": "object", "required": ["key", "interests"],
-        "properties": {"key": {"type": "string"}, "interests": {"type": "array", "items": {"enum": list(interests(db))}}}}}}}
+        "type": "object", "required": ["key", "interests", "notable"],
+        "properties": {"key": {"type": "string"}, "interests": {"type": "array", "items": {"enum": list(interests(db))}},
+                       "notable": {"type": "boolean"}}}}}}
 
 QUOTE_MARKS = str.maketrans({c: "'" for c in "‘’‚‛"} | {c: '"' for c in "“”„‟«»"})
 
@@ -798,15 +812,17 @@ def write(db):
 
 
 def tag(db):
-    """Sorts the written stories into the reader's interests, 100 per request. A story is tagged once; one the reply
-    leaves out is sent again next run. When Claude fails, Mistral tags the rest of the run."""
+    """Sorts the written stories into the reader's interests, 100 per request, and marks the notable ones. A story is
+    tagged once; one the reply leaves out is sent again next run, like one sorted before notable existed. When Claude
+    fails, Mistral tags the rest of the run."""
     writers = available_writers()
     wanted = interests(db)
     if not wanted:
         return
     names = {re.sub(r"\W", "", name).casefold(): name for name in wanted}  # Mistral may write "S&P500" or "football"
     rows = db.execute("SELECT id, headline, summary FROM stories WHERE updated >= ? AND headline IS NOT NULL"
-                      " AND interests IS NULL ORDER BY id", (iso(now() - SHOW),)).fetchall()
+                      " AND (interests IS NULL OR notable IS NULL AND interests != '[]') ORDER BY id",
+                      (iso(now() - SHOW),)).fetchall()
     tagged, start = 0, 0
     while start < len(rows) and writers:
         batch = rows[start:start + 100]
@@ -830,7 +846,8 @@ def tag(db):
                 if isinstance(answer, list):
                     given = {names.get(re.sub(r"\W", "", x).casefold()) for x in answer if isinstance(x, str)}
                     picked = [name for name in wanted if name in given]
-                    db.execute("UPDATE stories SET interests = ? WHERE id = ?", (json.dumps(picked), sid))
+                    db.execute("UPDATE stories SET interests = ?, notable = ? WHERE id = ?",
+                               (json.dumps(picked), int(bool(picked) and item.get("notable") is True), sid))
                     tagged += bool(picked)
             db.commit()
             if keyed:
@@ -968,6 +985,42 @@ def source_count(pairs):
     return len(independent(pairs))
 
 
+def weight(s, t):
+    """A story's place in the app's list at time t. A story outlets keep covering stays up; a big one they covered
+    yesterday makes way for today's news, further down but still there."""
+    newest = {}
+    for a in s["arts"]:
+        newest[a[1]] = max(newest.get(a[1], a[5]), a[5])
+    return sum(0.5 ** ((t - datetime.fromisoformat(max(newest[outlet] for outlet in group))) / FADE)
+               for group in independent([(a[1], a[7]) for a in s["arts"]]))
+
+
+def ranked(db, stories):
+    """The All list's order: by recent coverage, relative to the biggest story. A subject's notable stories that few
+    outlets cover would sink under that, so they count as NOTABLE_LIFT times the biggest story, fading like coverage
+    does: in the subject's own list all of them (the app orders it with each story's coverage and lift), in the All list
+    the NOTABLE_TOP freshest per subject of those the lift at least doubles; the subject's list keeps the others."""
+    t, subjects = now(), set(interests(db))
+    for s in stories:
+        s["coverage"], s["lift"] = weight(s, t), {}
+    top = max((s["coverage"] for s in stories), default=1)
+    candidates = defaultdict(list)
+    for s in stories:
+        lift = NOTABLE_LIFT * 0.5 ** ((t - datetime.fromisoformat(s["arts"][-1][5])) / FADE)
+        if s["notable"] and lift > s["coverage"] / top:
+            for subject in set(s["interests"]) & subjects:
+                s["lift"][subject] = lift
+                if lift >= 2 * s["coverage"] / top:  # the All list's few places go to stories it does much for
+                    candidates[subject].append((lift, s["id"]))
+    in_all = {sid for entries in candidates.values() for _, sid in sorted(entries, reverse=True)[:NOTABLE_TOP]}
+
+    def key(s):
+        lifts = s["lift"].values() if s["id"] in in_all else []
+        return max([s["coverage"] / top, *lifts]), s["coverage"]
+
+    return sorted(stories, key=key, reverse=True)
+
+
 def lean_counts(pairs, lean):
     """Independent sources per lean; a group of copies takes the lean of the first rated outlet in it."""
     counts = dict.fromkeys(["left", "center", "right"], 0)
@@ -1047,7 +1100,7 @@ def shown(db, ids=None):
     for r in rows:
         by_story[r[0]].append(r)
     written = {r[0]: r[1:] for r in db.execute(
-        "SELECT s.id, s.headline, s.summary, s.region, s.summary_articles, s.interests FROM stories s"
+        "SELECT s.id, s.headline, s.summary, s.region, s.summary_articles, s.interests, s.notable FROM stories s"
         f" WHERE {where} AND s.headline IS NOT NULL", params)}
     updates, quotes = defaultdict(list), defaultdict(list)
     for r in db.execute(f"""SELECT u.story, u.at, u.text, u.articles FROM updates u JOIN stories s ON s.id = u.story
@@ -1062,11 +1115,11 @@ def shown(db, ids=None):
         sources = source_count([(a[1], a[7]) for a in arts])
         if sources < 2 and all(a[6] for a in arts):
             continue  # a lone opinion column waits until the topic gets more coverage
-        headline, summary, region, summary_articles, interests = written.get(sid, (None,) * 5)
+        headline, summary, region, summary_articles, interests, notable = written.get(sid, (None,) * 6)
         # Once written, the region is Mistral's reading of what the story is about; before that, the outlets' regions.
         regions = ([region] if region else []) if headline else sorted({a[2] for a in arts if a[2]})
         stories.append(dict(id=sid, arts=arts, sources=sources, headline=headline, summary=summary, regions=regions,
-                            summary_articles=summary_articles, interests=json.loads(interests or "[]"),
+                            summary_articles=summary_articles, interests=json.loads(interests or "[]"), notable=bool(notable),
                             updates=updates[sid], quotes=quotes[sid]))
     stories.sort(key=lambda s: (s["sources"], s["arts"][-1][5]), reverse=True)
     return stories
@@ -1213,7 +1266,8 @@ def story_json(s, lean):
 
     return {
         "id": s["id"], "headline": s["headline"] or arts[0][3], "summary": s["summary"],
-        "tabs": s["regions"] + s["interests"],
+        "tabs": s["regions"] + s["interests"], "coverage": round(s.get("coverage", 0), 3),
+        "lift": {subject: round(lift, 3) for subject, lift in s.get("lift", {}).items()},
         "sources": s["sources"], "updated": arts[-1][5], "lean": lean_counts([(a[1], a[7]) for a in arts], lean), "summary_from": refs(s["summary_articles"]),
         "updates": [{"at": at, "text": text, "from": refs(ids)} for at, text, ids in s["updates"]],
         "quotes": [{"text": quote_en, "outlet": outlet, "url": url, "translated": normalized(quote) != normalized(quote_en)}
@@ -1256,9 +1310,10 @@ def search(db, query, most=100):
 
 
 def api(db):
-    """Everything the app shows in one document: the stories on the check page and the feed status."""
+    """Everything the app shows in one document: the stories on the check page, in the app's order, and the feed
+    status."""
     lean = leans(db)
-    stories = [story_json(s, lean) for s in shown(db)]
+    stories = [story_json(s, lean) for s in ranked(db, shown(db))]
     feeds = [{"name": name, "url": url, "items": items, "error": error, "checked": checked} for name, url, items, error, checked
              in db.execute("SELECT name, url, items, error, checked FROM sources ORDER BY error IS NULL, name")]
     return {"built": iso(now()), "tabs": list(places(db)) + list(interests(db)), "stories": stories, "feeds": feeds,
