@@ -58,7 +58,8 @@ OPINION_TITLE = re.compile(r"^(opinion|opinie|column)\s*[|:]|\|\s*(opinion|opini
 TAG = re.compile(r"<[^>]+>")
 REGIONS = ["Zwolle", "Overijssel", "NL", "EU", "US", "Global"]
 DUTCH_REGIONS = {"Zwolle", "Overijssel", "NL"}  # sources there write Dutch unless sources.toml says otherwise
-# The reader's interests, each a tab in the app; the description tells the model what belongs in it.
+# The reader's interests, each a tab in the app; the description tells the model what belongs in it. The app's settings
+# can replace them, like the spending caps below, the prompts and the feeds.
 INTERESTS = {
     "AI": "artificial intelligence: AI models and products, AI companies, chips for AI, AI rules, AI research",
     "Tech": "technology: tech companies, software, apps, gadgets, the internet, telecom, cybersecurity",
@@ -97,6 +98,7 @@ CREATE TABLE IF NOT EXISTS quotes(id INTEGER PRIMARY KEY, story INTEGER, article
 CREATE TABLE IF NOT EXISTS spend(day TEXT PRIMARY KEY, usd REAL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS reports(day TEXT PRIMARY KEY, body TEXT);
 CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(text, tokenize='unicode61 remove_diacritics 2');
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 """
 # Columns added after the first release; connect() adds them to older databases.
 COLUMNS = {"articles": ["lang TEXT", "title_en TEXT", "summary_en TEXT", "written INTEGER DEFAULT 0"],
@@ -124,29 +126,52 @@ def connect(path=None):
     return db
 
 
+def setting(db, key, default):
+    """What the app's settings changed, or the default. Only changes are stored, so new defaults still arrive."""
+    row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return json.loads(row[0]) if row else default
+
+
+def interests(db):
+    """The reader's interests, name -> what belongs in it."""
+    return setting(db, "interests", INTERESTS)
+
+
+def budgets(db):
+    """The daily spending caps in dollars."""
+    return {"claude": CLAUDE_DAILY_BUDGET, "mistral": DAILY_BUDGET} | setting(db, "budgets", {})
+
+
 def outlet_key(name):
     """'De Telegraaf', 'telegraaf.nl' and 'NRC - Nieuws, achtergronden' reduce to the same key as their source."""
     name = re.sub(r"\s+-\s.*", "", name.lower())
     return re.sub(r"^(www\.|w3\.)|\.(com|nl|org|net|co\.uk)$|^(the|de|het) ", "", name).replace(" ", "")
 
 
-def load_sources():
+def load_sources(db=None):
     """sources.toml holds one array per region (Topics: outlets without a region), outlet aliases, ignored outlets
-    and the outlets' lean."""
+    and the outlets' lean. With db, the feeds the app's settings removed and added count too."""
     data = tomllib.loads(SOURCES.read_text())
     aliases, ignore = data.pop("aliases", {}), data.pop("ignore", [])
     data.pop("lean", None)
+    edits = setting(db, "sources", {}) if db is not None else {}
+    # A feed the app added that sources.toml later lists too: the app's version counts.
+    removed = set(edits.get("removed", [])) | {s["url"] for s in edits.get("added", [])}
     sources = [s | {"region": None if region == "Topics" else region,
-                    "lang": s.get("lang", "nl" if region in DUTCH_REGIONS else "en")}
-               for region, items in data.items() for s in items]
+                    "lang": s.get("lang", "nl" if region in DUTCH_REGIONS else "en"), "opinion": s.get("opinion", False)}
+               for region, items in data.items() for s in items if s["url"] not in removed] + edits.get("added", [])
     names = {outlet_key(s["name"]): s["name"] for s in sources} | {outlet_key(a): n for a, n in aliases.items()}
     return sources, names, ignore
 
 
-def leans():
-    """Outlet key -> left, center or right, relative to the outlet's own country. Outlets not rated have no entry."""
+def leans(db=None):
+    """Outlet key -> left, center or right, relative to the outlet's own country. Outlets not rated have no entry.
+    With db, the app's changes count too."""
     table = tomllib.loads(SOURCES.read_text()).get("lean", {})
-    return {outlet_key(name): lean for lean, names in table.items() for name in names}
+    rated = {outlet_key(name): lean for lean, names in table.items() for name in names}
+    for name, lean in (setting(db, "sources", {}).get("lean", {}) if db is not None else {}).items():
+        rated[outlet_key(name)] = lean
+    return {key: lean for key, lean in rated.items() if lean}
 
 
 def text(el):
@@ -218,7 +243,7 @@ def fetch(source):
 
 
 def collect(db):
-    sources, names, ignore = load_sources()
+    sources, names, ignore = load_sources(db)
     listed = set(names.values())
     t = now()
     # Socket timeouts only limit each read, so a server that drips its headers could hold a fetch forever.
@@ -282,6 +307,8 @@ def group(db):
     # roughly 0.5 GB a year; prune old rows if the disk ever minds.
     db.execute("UPDATE articles SET vec = NULL WHERE published < ?", (iso(now() - 3 * OPEN_FOR),))
     db.execute("UPDATE stories SET vec = NULL WHERE updated < ?", (iso(now() - 3 * OPEN_FOR),))
+    # Committed before the slow parts (the model, the embedding), so a settings change from the app doesn't wait on them.
+    db.commit()
     if os.environ.get("MISTRAL_API_KEY"):
         try:
             translate(db)
@@ -293,6 +320,7 @@ def group(db):
         batch = todo[i:i + 256]
         vecs = embed([f"{title}. {summary[:300]}" for _, title, summary in batch])
         db.executemany("UPDATE articles SET vec = ? WHERE id = ?", [(v.tobytes(), r[0]) for r, v in zip(batch, vecs)])
+        db.commit()
 
     new = db.execute("SELECT id, published, vec FROM articles WHERE story IS NULL AND vec IS NOT NULL ORDER BY published").fetchall()
     if not new:
@@ -378,13 +406,13 @@ class ClaudeFailed(ValueError):
     """One request went wrong (a timeout, an unreadable reply): that batch is tried again next run."""
 
 
-def call_claude(model, system, payload):
+def call_claude(model, system, payload, schema):
     """One request through Claude Code in print mode: our system prompt instead of Claude Code's, no tools, one turn.
     Returns the reply text and Claude Code's API-equivalent cost estimate."""
     # --tools "" removes Claude Code's own tools; the JSON schema is answered through its structured-output tool,
     # which takes a second turn (a third if the first answer doesn't validate).
     cmd = ["claude", "-p", "--model", model, "--effort", CLAUDE_EFFORT, "--system-prompt", system,
-           "--output-format", "json", "--json-schema", json.dumps(SCHEMAS[system]), "--tools", "",
+           "--output-format", "json", "--json-schema", json.dumps(schema), "--tools", "",
            "--max-turns", "3", "--no-session-persistence", "--disable-slash-commands", "--strict-mcp-config"]
     try:
         run = subprocess.run(cmd, input=json.dumps(payload, ensure_ascii=False), capture_output=True, text=True,
@@ -412,21 +440,23 @@ def call_claude(model, system, payload):
     return json.dumps(reply["structured_output"]), float(reply.get("total_cost_usd") or 0)
 
 
-def ask(db, model, system, payload, max_tokens):
-    """One JSON request within the day's budget; the cost is recorded before the reply is parsed."""
+def ask(db, model, kind, payload, max_tokens):
+    """One JSON request with the prompt of this kind, within the day's budget; the cost is recorded before the reply is
+    parsed."""
+    system, caps = system_prompt(db, kind), budgets(db)
     day = now().date().isoformat()
     # Only read before the request: a write here would hold the database lock for as long as the model takes.
     usd, claude_usd = db.execute("SELECT COALESCE(usd, 0), COALESCE(claude_usd, 0) FROM spend WHERE day = ?",
                                  (day,)).fetchone() or (0, 0)
     if model.startswith("claude"):
-        if claude_usd >= CLAUDE_DAILY_BUDGET:
-            raise ClaudeUnavailable(f"daily Claude budget of ${CLAUDE_DAILY_BUDGET:.2f} (API-equivalent) reached")
-        content, cost = call_claude(model, system, payload)
+        if claude_usd >= caps["claude"]:
+            raise ClaudeUnavailable(f"daily Claude budget of ${caps['claude']:.2f} (API-equivalent) reached")
+        content, cost = call_claude(model, system, payload, reply_schema(db, kind))
         db.execute("INSERT OR IGNORE INTO spend(day) VALUES (?)", (day,))
         db.execute("UPDATE spend SET claude_usd = COALESCE(claude_usd, 0) + ? WHERE day = ?", (cost, day))
     else:
-        if usd >= DAILY_BUDGET:
-            raise OverBudget(f"daily Mistral budget of ${DAILY_BUDGET:.2f} reached")
+        if usd >= caps["mistral"]:
+            raise OverBudget(f"daily Mistral budget of ${caps['mistral']:.2f} reached")
         content, (tokens_in, tokens_out) = call_mistral(model, system, payload, max_tokens)
         cost = (tokens_in * PRICES[model][0] + tokens_out * PRICES[model][1]) / 1e6
         db.execute("INSERT OR IGNORE INTO spend(day) VALUES (?)", (day,))
@@ -436,22 +466,21 @@ def ask(db, model, system, payload, max_tokens):
 
 
 TRANSLATE_PROMPT = """Translate each item's Dutch title and text into English.
-Keep names, numbers and meaning exactly; add nothing, leave out nothing, keep the tone neutral.
-Return JSON: {"items": [{"id": <id>, "title": "<English title>", "text": "<English text>"}]}"""
+Keep names, numbers and meaning exactly; add nothing, leave out nothing, keep the tone neutral."""
 
 
 def translate(db):
     """English titles and teasers for Dutch articles, shown on the page and used for grouping."""
     if db.execute("SELECT 1 FROM articles WHERE lang IS NULL LIMIT 1").fetchone():  # collected before lang existed
         db.executemany("UPDATE articles SET lang = ? WHERE lang IS NULL AND outlet = ?",
-                       [(src["lang"], src["name"]) for src in load_sources()[0]])
+                       [(src["lang"], src["name"]) for src in load_sources(db)[0]])
         db.execute("UPDATE articles SET lang = CASE WHEN region IN ('Zwolle', 'Overijssel', 'NL') THEN 'nl' ELSE 'en' END"
                    " WHERE lang IS NULL")
     todo = db.execute("SELECT id, title, summary FROM articles WHERE lang = 'nl' AND title_en IS NULL"
                       " AND published >= ?", (iso(now() - OPEN_FOR),)).fetchall()
     for i in range(0, len(todo), 20):
         batch = {r[0]: r for r in todo[i:i + 20]}
-        result = ask(db, TRANSLATOR, TRANSLATE_PROMPT,
+        result = ask(db, TRANSLATOR, "translate",
                      {"items": [{"id": a, "title": t, "text": s[:300]} for a, t, s in batch.values()]}, 4000)
         for item in result.get("items", []):
             if item.get("id") in batch and isinstance(item.get("title"), str) and item["title"].strip():
@@ -491,54 +520,85 @@ possibly in Dutch. For every story write:
   never more than 4 sentences or 90 words. Short beats padded.
 - region: the most specific place the story is about. One of: Zwolle (the city of Zwolle), Overijssel (elsewhere in the
   province), NL (elsewhere in the Netherlands, or national), EU (EU institutions or other European countries), US,
-  Global (anywhere else, or worldwide), or None when it is about no place (a product launch, a study, an album).
-""" + RULES + """
-Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "region": "...",
-"quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}"""
+  Global (anywhere else, or worldwide), or None when it is about no place (a product launch, a study, an album)."""
 
 UPDATE_PROMPT = """You keep a running story in a private news app up to date. You get its current text (headline,
 summary, earlier updates) and new articles. For each new article that states something the current text doesn't have
 yet, write at most one English sentence with only what that article itself says, from its own title and text: nothing from
 the current text or the other articles, and no day, date, number or name the article doesn't give. Skip articles that
-add nothing new; most stories need one or two sentences, some none.
-""" + RULES + """
-Return JSON: {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "..."}],
-"quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}"""
+add nothing new; most stories need one or two sentences, some none."""
 
 TAG_PROMPT = """You sort the stories of a private news app into the reader's interests. For each story, list the
-interests it is about, from these:
-""" + "\n".join(f"- {name}: {about}" for name, about in INTERESTS.items()) + """
-A story can have several interests or none; most stories have none. Pick an interest only when the story itself is
-about it, not when it comes up in passing. Include every story, with an empty list when no interest fits, and refer to
-stories by their key exactly as given ("s1").
-Return JSON: {"stories": [{"key": "s1", "interests": ["AI", "Tech"]}]}"""
+interests it is about, from the list below. A story can have several interests or none; most stories have none. Pick an
+interest only when the story itself is about it, not when it comes up in passing. Include every story, with an empty
+list when no interest fits, and refer to stories by their key exactly as given ("s1")."""
 
 REPORT_PROMPT = """You write the morning report of a private news app. For each story write one plain English sentence of at
 most 18 words, two lines on a phone, that says what happened, including the latest update if there is one. Use only the given headline,
 summary and updates: no new facts, no opinions, no loaded words. The headline is shown above your sentence, so don't
-repeat it. Refer to stories by their key exactly as given ("s1").
-Return JSON: {"stories": [{"key": "s1", "gist": "..."}]}"""
+repeat it. Refer to stories by their key exactly as given ("s1")."""
+
+# The prompts by kind, with their name and what the app says about them. The app can replace each text; the code adds
+# the writing rules, the interests and the reply format, which it depends on and so can't be changed.
+PROMPTS = {"translate": TRANSLATE_PROMPT, "rules": RULES, "new": NEW_PROMPT, "update": UPDATE_PROMPT, "tag": TAG_PROMPT,
+           "report": REPORT_PROMPT}
+PROMPT_NOTES = {
+    "translate": ("Translation", "Mistral turns Dutch headlines and teasers into English. The reply format is added after it."),
+    "rules": ("Writing rules", "Added to the prompts for new stories and for updates."),
+    "new": ("New stories", "Writes a new story's headline and summary. The writing rules and the reply format are added after it."),
+    "update": ("Updates", "Adds a sentence to a story for each new article. The writing rules and the reply format are added "
+                          "after it."),
+    "tag": ("Interests", "Sorts stories into your interests. The interests and the reply format are added after it."),
+    "report": ("Morning report", "Writes the one-sentence gists of the morning report. The reply format is added after it."),
+}
+FORMATS = {
+    "translate": 'Return JSON: {"items": [{"id": <id>, "title": "<English title>", "text": "<English text>"}]}',
+    "new": """Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "region": "...",
+"quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}""",
+    "update": """Return JSON: {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "..."}],
+"quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}""",
+    "tag": 'Return JSON: {"stories": [{"key": "s1", "interests": ["AI", "Tech"]}]}',
+    "report": 'Return JSON: {"stories": [{"key": "s1", "gist": "..."}]}',
+}
 
 QUOTES_SCHEMA = {"type": "array", "items": {"type": "object", "required": ["article", "quote", "quote_en"],
                                              "properties": {"article": {"type": "string"}, "quote": {"type": "string"},
                                                             "quote_en": {"type": "string"}}}}
 SCHEMAS = {
-    NEW_PROMPT: {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
+    "new": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
         "type": "object", "required": ["key", "headline", "summary", "region"],
         "properties": {"key": {"type": "string"}, "headline": {"type": "string"}, "summary": {"type": "string"},
                        "region": {"enum": REGIONS + ["None"]}, "quotes": QUOTES_SCHEMA}}}}},
-    UPDATE_PROMPT: {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
+    "update": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
         "type": "object", "required": ["key", "facts"],
         "properties": {"key": {"type": "string"}, "quotes": QUOTES_SCHEMA, "facts": {"type": "array", "items": {
             "type": "object", "required": ["article", "fact"],
             "properties": {"article": {"type": "string"}, "fact": {"type": "string"}}}}}}}}},
-    REPORT_PROMPT: {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
+    "report": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
         "type": "object", "required": ["key", "gist"],
         "properties": {"key": {"type": "string"}, "gist": {"type": "string"}}}}}},
-    TAG_PROMPT: {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
-        "type": "object", "required": ["key", "interests"],
-        "properties": {"key": {"type": "string"}, "interests": {"type": "array", "items": {"enum": list(INTERESTS)}}}}}}},
 }
+
+
+def system_prompt(db, kind):
+    """A prompt as the model gets it: its text (the app's when it changed it), then the writing rules or the interests
+    where they belong, then the reply format."""
+    edited = setting(db, "prompts", {})
+    parts = [edited.get(kind) or PROMPTS[kind]]
+    if kind in ("new", "update"):
+        parts.append(edited.get("rules") or RULES)
+    if kind == "tag":
+        parts.append("Interests:\n" + "\n".join(f"- {name}: {about}" for name, about in interests(db).items()))
+    return "\n".join(parts + [FORMATS[kind]])
+
+
+def reply_schema(db, kind):
+    """What Claude Code checks a reply against; the interests can change, so theirs is made here."""
+    if kind != "tag":
+        return SCHEMAS[kind]
+    return {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
+        "type": "object", "required": ["key", "interests"],
+        "properties": {"key": {"type": "string"}, "interests": {"type": "array", "items": {"enum": list(interests(db))}}}}}}}
 
 QUOTE_MARKS = str.maketrans({c: "'" for c in "‘’‚‛"} | {c: '"' for c in "“”„‟«»"})
 
@@ -629,12 +689,12 @@ def write(db):
     updates.sort(key=lambda st: -st["sources"])
     # Stories with several sources first, then updates, then single-source stories, in case the budget runs out.
     # Updates go one story per request: in batches the model left most of them empty.
-    work = ([(NEW_PROMPT, b) for b in batches([st for st in new if st["sources"] > 1], 6, 30)]
-            + [(UPDATE_PROMPT, b) for b in batches(updates, 1, 30)]
-            + [(NEW_PROMPT, b) for b in batches([st for st in new if st["sources"] == 1], 10, 30)])
+    work = ([("new", b) for b in batches([st for st in new if st["sources"] > 1], 6, 30)]
+            + [("update", b) for b in batches(updates, 1, 30)]
+            + [("new", b) for b in batches([st for st in new if st["sources"] == 1], 10, 30)])
     written = updated = failures = 0
     try:
-        for prompt, batch in work:
+        for kind, batch in work:
             # Short keys per request: models copy "s2" and "a7" back reliably, long database ids not always.
             keyed, stories, n = {}, [], 0
             for i, st in enumerate(batch, 1):
@@ -650,7 +710,7 @@ def write(db):
             try:
                 while True:
                     try:
-                        result = ask(db, writers[0], prompt, {"stories": stories}, 4000)
+                        result = ask(db, writers[0], kind, {"stories": stories}, 4000)
                         failures = 0
                         break
                     except ClaudeFailed as e:
@@ -670,7 +730,7 @@ def write(db):
                     st, articles = keyed.pop(key, (None, None)) if isinstance(key, str) else (None, None)
                     if not st:
                         continue
-                    if prompt is NEW_PROMPT:
+                    if kind == "new":
                         headline, summary = str(item.get("headline") or "").strip(), str(item.get("summary") or "").strip()
                         if not headline or not summary:
                             continue
@@ -709,7 +769,10 @@ def tag(db):
     """Sorts the written stories into the reader's interests, 100 per request. A story is tagged once; one the reply
     leaves out is sent again next run. When Claude fails, Mistral tags the rest of the run."""
     writers = available_writers()
-    names = {re.sub(r"\W", "", name).casefold(): name for name in INTERESTS}  # Mistral may write "S&P500" or "football"
+    wanted = interests(db)
+    if not wanted:
+        return
+    names = {re.sub(r"\W", "", name).casefold(): name for name in wanted}  # Mistral may write "S&P500" or "football"
     rows = db.execute("SELECT id, headline, summary FROM stories WHERE updated >= ? AND headline IS NOT NULL"
                       " AND interests IS NULL ORDER BY id", (iso(now() - SHOW),)).fetchall()
     tagged, start = 0, 0
@@ -719,15 +782,22 @@ def tag(db):
         payload = {"stories": [{"key": f"s{i}", "headline": headline, "summary": summary}
                                for i, (_, headline, summary) in enumerate(batch, 1)]}
         try:
-            result = ask(db, writers[0], TAG_PROMPT, payload, 4000)
+            result = ask(db, writers[0], "tag", payload, 4000)
+            # The app may have changed the interests while the model was sorting; then the pass it started sorts
+            # these stories again. Checked with the write lock held, so a change can't slip in before the writes.
+            db.execute("BEGIN IMMEDIATE")
+            if interests(db) != wanted:
+                db.rollback()
+                print("tag: the interests changed, sorted again in the next pass", flush=True)
+                break
             items = result.get("stories") if isinstance(result, dict) else None
             for item in items if isinstance(items, list) else []:
                 key = item.get("key") if isinstance(item, dict) else None
                 sid = keyed.pop(key, None) if isinstance(key, str) else None
-                interests = item.get("interests") if sid else None
-                if isinstance(interests, list):
-                    given = {names.get(re.sub(r"\W", "", x).casefold()) for x in interests if isinstance(x, str)}
-                    picked = [name for name in INTERESTS if name in given]
+                answer = item.get("interests") if sid else None
+                if isinstance(answer, list):
+                    given = {names.get(re.sub(r"\W", "", x).casefold()) for x in answer if isinstance(x, str)}
+                    picked = [name for name in wanted if name in given]
                     db.execute("UPDATE stories SET interests = ? WHERE id = ?", (json.dumps(picked), sid))
                     tagged += bool(picked)
             db.commit()
@@ -773,7 +843,7 @@ def gists(db, stories):
                             "updates": [text for _, text, _ in s["updates"]]} for i, s in enumerate(stories, 1)]}
     for writer in available_writers() if stories else []:
         try:
-            result = ask(db, writer, REPORT_PROMPT, payload, 4000)
+            result = ask(db, writer, "report", payload, 4000)
             items = result.get("stories") if isinstance(result, dict) else None
             for item in items if isinstance(items, list) else []:
                 key, gist = (item.get("key"), item.get("gist")) if isinstance(item, dict) else (None, None)
@@ -811,7 +881,7 @@ def morning(db, t=None):
         major = [s for s in stories if region in s["regions"] and s["sources"] >= MAJOR[region]][:REPORT_PER_REGION]
         sections.append((region, major))
         picked |= {s["id"] for s in major}
-    for interest in INTERESTS:
+    for interest in interests(db):
         top = [s for s in stories if interest in s["interests"] and s["id"] not in picked][:REPORT_PER_INTEREST]
         sections.append((interest, top))
         picked |= {s["id"] for s in top}
@@ -1149,18 +1219,130 @@ def search(db, query, most=100):
     ids = [r[0] for r in db.execute("SELECT s.id FROM search_index JOIN stories s ON s.id = search_index.rowid"
                                     " WHERE search_index MATCH ? ORDER BY s.updated DESC LIMIT ?", (match, most))]
     order = {sid: i for i, sid in enumerate(ids)}
-    lean = leans()
+    lean = leans(db)
     return [story_json(s, lean) for s in sorted(shown(db, ids), key=lambda s: order[s["id"]])] if ids else []
 
 
 def api(db):
     """Everything the app shows in one document: the stories on the check page and the feed status."""
-    lean = leans()
+    lean = leans(db)
     stories = [story_json(s, lean) for s in shown(db)]
     feeds = [{"name": name, "url": url, "items": items, "error": error, "checked": checked} for name, url, items, error, checked
              in db.execute("SELECT name, url, items, error, checked FROM sources ORDER BY error IS NULL, name")]
-    return {"built": iso(now()), "tabs": REGIONS + list(INTERESTS), "stories": stories, "feeds": feeds,
+    return {"built": iso(now()), "tabs": REGIONS + list(interests(db)), "stories": stories, "feeds": feeds,
             "report": latest_report(db)}
+
+
+def settings_json(db):
+    """What the app's settings show: the interests, the feeds with their outlet's lean, the spending caps and the prompts."""
+    lean, edited = leans(db), setting(db, "prompts", {})
+    return {
+        "regions": REGIONS,
+        "interests": [{"name": name, "about": about} for name, about in interests(db).items()],
+        "sources": [{"region": s["region"], "name": s["name"], "url": s["url"], "lang": s["lang"], "opinion": s["opinion"],
+                     "lean": lean.get(outlet_key(s["name"]))} for s in load_sources(db)[0]],
+        "budgets": budgets(db),
+        "prompts": [{"kind": kind, "title": title, "about": about, "text": edited.get(kind, PROMPTS[kind]),
+                     "default": PROMPTS[kind]} for kind, (title, about) in PROMPT_NOTES.items()],
+    }
+
+
+def field(item, key):
+    value = item.get(key) if isinstance(item, dict) else None
+    return value.strip() if isinstance(value, str) else ""
+
+
+def save_settings(db, changes):
+    """Checks and stores the parts of the settings the app sends; a ValueError's message is shown in the app. Returns
+    whether the interests changed: the recent stories are then sorted again."""
+    if not isinstance(changes, dict) or not set(changes) <= {"interests", "sources", "budgets", "prompts"}:
+        raise ValueError("The app sent settings the server doesn't know.")
+    new, before = {}, interests(db)
+    if "interests" in changes:
+        # tag() matches the model's answers on letters and digits only, and the tabs can't have the same name twice.
+        found, taken = {}, {re.sub(r"\W", "", tab).casefold() for tab in REGIONS + ["All"]}
+        for item in changes["interests"] if isinstance(changes["interests"], list) else [None]:
+            name, about = field(item, "name"), field(item, "about")
+            key = re.sub(r"\W", "", name).casefold()
+            if not key or not about:
+                raise ValueError("Each interest needs a name and a description.")
+            if len(name) > 40 or len(about) > 1000:
+                raise ValueError(f"{name[:40]}: keep the name under 40 characters and the description under 1000.")
+            if key in taken:
+                raise ValueError(f"There's already a tab called {name}.")
+            taken.add(key)
+            found[name] = about
+        new["interests"] = found
+    if "sources" in changes:
+        bundled, rated = load_sources()[0], leans()
+        feeds, urls, outlets, lean = [], set(), {}, {}
+        for item in changes["sources"] if isinstance(changes["sources"], list) else [None]:
+            name, url = field(item, "name"), field(item, "url")
+            region, lang, opinion, rating = (item.get(k) for k in ("region", "lang", "opinion", "lean")) \
+                if isinstance(item, dict) else (0, 0, 0, 0)
+            if not name:
+                raise ValueError("Each feed needs a name.")
+            address = urlsplit(url)
+            if address.scheme not in ("http", "https") or not address.hostname:
+                raise ValueError(f"{name}: the address needs to start with http:// or https://.")
+            if region not in REGIONS + [None] or lang not in ("nl", "en") or not isinstance(opinion, bool) \
+                    or rating not in (None, "left", "center", "right"):
+                raise ValueError(f"{name}: the app sent a region, language or lean the server doesn't know.")
+            if url in urls:
+                raise ValueError(f"{url} is in the list twice.")
+            urls.add(url)
+            # Articles are credited to an outlet by its loosely matched name, so one outlet can't have two names.
+            if outlets.setdefault(outlet_key(name), name) != name:
+                raise ValueError(f"{name} and {outlets[outlet_key(name)]} are the same outlet; give them the same name.")
+            if lean.setdefault(name, rating) != rating:
+                raise ValueError(f"The feeds of {name} have different leans.")
+            feeds.append({"region": region, "name": name, "url": url, "lang": lang, "opinion": opinion})
+
+        def fields(s):
+            return s["region"], s["name"], s["url"], s["lang"], s["opinion"]
+
+        kept, listed = {fields(s) for s in feeds}, {fields(s) for s in bundled}
+        new["sources"] = {"removed": [s["url"] for s in bundled if fields(s) not in kept],
+                          "added": [s for s in feeds if fields(s) not in listed],
+                          "lean": {name: rating for name, rating in lean.items() if rated.get(outlet_key(name)) != rating}}
+    if "budgets" in changes:
+        caps = changes["budgets"] if isinstance(changes["budgets"], dict) else {}
+        for writer in ("claude", "mistral"):
+            cap = caps.get(writer)
+            if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not 0 <= cap < float("inf"):
+                raise ValueError("A spending cap is an amount of dollars, 0 or more.")
+        new["budgets"] = {writer: float(caps[writer]) for writer in ("claude", "mistral")}
+    if "prompts" in changes:
+        texts, edited = changes["prompts"], setting(db, "prompts", {})
+        if not isinstance(texts, dict) or not set(texts) <= set(PROMPTS):
+            raise ValueError("The app sent a prompt the server doesn't know.")
+        for kind, text in texts.items():
+            text = text.strip() if isinstance(text, str) else ""
+            if len(text) > 20_000:
+                raise ValueError("Keep a prompt under 20,000 characters.")
+            if text and text != PROMPTS[kind]:
+                edited[kind] = text
+            else:  # empty or the default: back to the default, and to later versions of it
+                edited.pop(kind, None)
+        new["prompts"] = edited
+    db.executemany("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+                   [(key, json.dumps(value, ensure_ascii=False)) for key, value in new.items()])
+    changed = "interests" in new and new["interests"] != before
+    if changed:
+        db.execute("UPDATE stories SET interests = NULL WHERE updated >= ?", (iso(now() - SHOW),))
+    db.commit()
+    return changed
+
+
+# The processing run and a change of interests in the app can both start sorting stories; one at a time.
+TAGGING = threading.Lock()
+
+
+def retag():
+    """Sorts the recent stories into the changed interests in the background, so their tabs fill within minutes instead
+    of at the next processing run."""
+    with TAGGING, closing(connect()) as db:
+        tag(db)
 
 
 HEAD = '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">'
@@ -1170,7 +1352,7 @@ class Page(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlsplit(self.path)
         path = url.path
-        if path not in ("/", "/api/stories", "/api/report", "/api/search"):
+        if path not in ("/", "/api/stories", "/api/report", "/api/search", "/api/settings"):
             return self.send_error(404)
         with closing(connect()) as db:
             if path == "/":
@@ -1178,14 +1360,42 @@ class Page(BaseHTTPRequestHandler):
             else:
                 if path == "/api/search":
                     data = {"stories": search(db, " ".join(parse_qs(url.query).get("q", [])))}
+                elif path == "/api/settings":
+                    data = settings_json(db)
                 else:
                     data = api(db) if path == "/api/stories" else latest_report(db)
                 body, kind = json.dumps(data, ensure_ascii=False).encode(), "application/json"
+        self.send(body, kind)
+
+    def do_POST(self):
+        """Changes the settings. Only a JSON body is taken: a web page has to ask a server first before it sends one
+        there, and this server never says yes, so no site open in a browser on the network can change them."""
+        if urlsplit(self.path).path != "/api/settings":
+            return self.send_error(404)
+        if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
+            return self.send_error(415)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= 1_000_000:
+                raise ValueError("The settings the app sent are empty or too big.")
+            changes = json.loads(self.rfile.read(length))
+            with closing(connect()) as db:
+                db.execute("PRAGMA busy_timeout = 10000")  # well within the app's 30 seconds
+                if save_settings(db, changes):
+                    threading.Thread(target=retag, daemon=True).start()
+                data, status = settings_json(db), 200
+        except (ValueError, OverflowError, RecursionError) as e:  # a number too big for a float, JSON nested too deep
+            data, status = {"error": str(e)}, 400
+        except sqlite3.OperationalError:
+            data, status = {"error": "The server is busy with the news. Try again in a minute."}, 503
+        self.send(json.dumps(data, ensure_ascii=False).encode(), "application/json", status)
+
+    def send(self, body, kind, status=200):
         packed = "gzip" in self.headers.get("Accept-Encoding", "")
         if packed:
             body = gzip.compress(body)
         try:
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", kind)
             if packed:
                 self.send_header("Content-Encoding", "gzip")
@@ -1216,7 +1426,8 @@ def run():
                     group(db)
                     grouped = started
                     write(db)
-                    tag(db)
+                    with TAGGING:
+                        tag(db)
                     index(db)
                 morning(db)
         except Exception:

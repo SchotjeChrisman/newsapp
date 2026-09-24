@@ -7,6 +7,8 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -38,12 +40,15 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -79,6 +84,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -109,6 +115,8 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 @Composable
 fun NewsTheme(content: @Composable () -> Unit) {
@@ -274,6 +282,7 @@ fun StoriesScreen(
     onRefresh: () -> Unit,
     onOpen: (Story) -> Unit,
     onFeeds: () -> Unit,
+    onSettings: () -> Unit,
     onServer: () -> Unit,
     bottomBar: @Composable () -> Unit,
 ) {
@@ -285,7 +294,7 @@ fun StoriesScreen(
                 IconButton(onClick = { menu = true }) { Icon(painterResource(R.drawable.ic_more), "More") }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     DropdownMenuItem(text = { Text("Feed status") }, onClick = { menu = false; onFeeds() })
-                    DropdownMenuItem(text = { Text("Server") }, onClick = { menu = false; onServer() })
+                    DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; onSettings() })
                 }
             }
         },
@@ -804,6 +813,338 @@ fun ServerScreen(current: String, onBack: (() -> Unit)?, onSave: (String) -> Uni
             version?.let {
                 Text("Version $it", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+        }
+    }
+}
+
+private fun dollars(amount: Double) = String.format(Locale.ENGLISH, "$%.2f", amount)
+
+/** An amount typed in a field: "0,60" works too. Null when it isn't one. */
+private fun String.amount() = trim().removePrefix("$").replace(',', '.').toDoubleOrNull()?.takeIf { it >= 0 && it.isFinite() }
+
+@Composable
+private fun Hint(text: String, modifier: Modifier = Modifier) {
+    Text(text, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = modifier)
+}
+
+@Composable
+private fun Row2(title: String, detail: String, index: Int, count: Int, onClick: () -> Unit) {
+    Segment(index, count, onClick = onClick) {
+        Text(title, style = MaterialTheme.typography.bodyLarge)
+        Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
+fun SettingsScreen(
+    server: String,
+    settings: Settings?,
+    error: String?,
+    onBack: () -> Unit,
+    onRetry: () -> Unit,
+    onServer: () -> Unit,
+    onInterests: () -> Unit,
+    onSources: () -> Unit,
+    onPrompts: () -> Unit,
+    save: suspend (JSONObject) -> String?,
+) {
+    var caps by rememberSaveable { mutableStateOf(false) }
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("Settings") }, navigationIcon = { BackButton(onBack) }) },
+        contentWindowInsets = WindowInsets.safeDrawing,
+    ) { padding ->
+        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp, 0.dp, 16.dp, 16.dp)) {
+            item { Row2("Server", server, 0, 1, onServer) }
+            item { SectionLabel("On the server", Modifier.padding(4.dp, 24.dp, 4.dp, 8.dp)) }
+            if (error != null) {
+                item {
+                    Banner(error, Modifier.padding(bottom = 8.dp))
+                    OutlinedButton(onClick = onRetry) { Text("Try again") }
+                }
+            }
+            if (settings == null) {
+                if (error == null) item { LinearProgressIndicator(Modifier.fillMaxWidth().padding(4.dp, 8.dp)) }
+            } else {
+                val changed = settings.prompts.count { it.text != it.default }
+                val rows = listOf(
+                    Triple("Interests", settings.interests.joinToString(", ") { it.name }.ifEmpty { "None" }, onInterests),
+                    Triple("News sources", plural(settings.sources.size, "feed"), onSources),
+                    Triple("Spending caps", "Claude ${dollars(settings.claudeCap)}, Mistral ${dollars(settings.mistralCap)} a day") { caps = true },
+                    Triple("Prompts", if (changed == 0) "As they came" else "$changed changed", onPrompts),
+                )
+                itemsIndexed(rows) { i, (title, detail, open) -> Row2(title, detail, i, rows.size, open) }
+            }
+        }
+    }
+    if (caps && settings != null) CapsDialog(settings, onDismiss = { caps = false }, save = save)
+}
+
+/** A dialog that changes one item of a list and saves the whole list. It stays open with the reason when the server
+ *  or the network turns the change down. */
+@Composable
+private fun EditDialog(
+    title: String,
+    canSave: Boolean,
+    onDismiss: () -> Unit,
+    onSave: suspend () -> String?,
+    onDelete: (suspend () -> String?)? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    fun run(action: suspend () -> String?) {
+        busy = true
+        error = null
+        scope.launch {
+            error = action()
+            busy = false
+            if (error == null) onDismiss()
+        }
+    }
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text(title) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                content()
+                error?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = { TextButton(onClick = { run(onSave) }, enabled = canSave && !busy) { Text("Save") } },
+        dismissButton = {
+            Row {
+                onDelete?.let { TextButton(onClick = { run(it) }, enabled = !busy) { Text("Delete") } }
+                TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") }
+            }
+        },
+    )
+}
+
+@Composable
+private fun CapsDialog(settings: Settings, onDismiss: () -> Unit, save: suspend (JSONObject) -> String?) {
+    var claude by rememberSaveable { mutableStateOf(settings.claudeCap.toBigDecimal().stripTrailingZeros().toPlainString()) }
+    var mistral by rememberSaveable { mutableStateOf(settings.mistralCap.toBigDecimal().stripTrailingZeros().toPlainString()) }
+    EditDialog(
+        title = "Spending caps",
+        canSave = claude.amount() != null && mistral.amount() != null,
+        onDismiss = onDismiss,
+        onSave = { save(capsJson(claude.amount()!!, mistral.amount()!!)) },
+    ) {
+        Hint("The most each may spend in a day, in dollars. Past Claude's cap, Mistral writes; past both, new stories " +
+            "wait until the next day to be written.")
+        listOf(Triple("Claude (API-equivalent)", claude) { v: String -> claude = v }, Triple("Mistral", mistral) { v: String -> mistral = v })
+            .forEach { (label, value, change) ->
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = change,
+                    label = { Text(label) },
+                    prefix = { Text("$") },
+                    isError = value.amount() == null,
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+    }
+}
+
+@Composable
+fun InterestsScreen(interests: List<Interest>, onBack: () -> Unit, save: suspend (JSONObject) -> String?) {
+    // The one being changed: its place in the list, or -1 for a new one.
+    var editing by rememberSaveable { mutableStateOf<Int?>(null) }
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("Interests") }, navigationIcon = { BackButton(onBack) }) },
+        floatingActionButton = { ExtendedFloatingActionButton(onClick = { editing = -1 }) { Text("Add interest") } },
+        contentWindowInsets = WindowInsets.safeDrawing,
+    ) { padding ->
+        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp, 0.dp, 16.dp, 88.dp)) {
+            item {
+                Hint(
+                    "Each interest is a tab and a part of the morning report. Claude sorts stories into them by their " +
+                        "descriptions. After a change, the stories of the last two days are sorted again, which takes a few minutes.",
+                    Modifier.padding(4.dp, 4.dp, 4.dp, 12.dp),
+                )
+            }
+            itemsIndexed(interests) { i, interest -> Row2(interest.name, interest.about, i, interests.size) { editing = i } }
+        }
+    }
+    editing?.let { i ->
+        val interest = interests.getOrNull(i)
+        var name by rememberSaveable(i) { mutableStateOf(interest?.name ?: "") }
+        var about by rememberSaveable(i) { mutableStateOf(interest?.about ?: "") }
+        EditDialog(
+            title = if (interest == null) "New interest" else "Interest",
+            canSave = name.isNotBlank() && about.isNotBlank(),
+            onDismiss = { editing = null },
+            onSave = {
+                val changed = Interest(name.trim(), about.trim())
+                save(interestsJson(if (interest == null) interests + changed else interests.map { if (it == interest) changed else it }))
+            },
+            onDelete = interest?.let { { save(interestsJson(interests - it)) } },
+        ) {
+            OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(
+                about, { about = it },
+                label = { Text("What belongs in it") },
+                minLines = 3,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+private val leanNames = listOf("" to "None", "left" to "Left", "center" to "Center", "right" to "Right")
+
+@Composable
+private fun Choices(label: String, options: List<Pair<String, String>>, selected: String, onSelect: (String) -> Unit) {
+    Text(label, style = MaterialTheme.typography.labelLarge)
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        options.forEach { (value, text) -> FilterChip(selected = value == selected, onClick = { onSelect(value) }, label = { Text(text) }) }
+    }
+}
+
+@Composable
+fun SourcesScreen(settings: Settings, onBack: () -> Unit, save: suspend (JSONObject) -> String?) {
+    val regions = settings.regions + "Topics"
+    var region by rememberSaveable { mutableStateOf("All") }
+    // The address of the feed being changed, or "" for a new one.
+    var editing by rememberSaveable { mutableStateOf<String?>(null) }
+    val shown = remember(settings, region) {
+        settings.sources.filter { region == "All" || (it.region ?: "Topics") == region }.sortedBy { regions.indexOf(it.region ?: "Topics") }
+    }
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("News sources") }, navigationIcon = { BackButton(onBack) }) },
+        floatingActionButton = { ExtendedFloatingActionButton(onClick = { editing = "" }) { Text("Add feed") } },
+        contentWindowInsets = WindowInsets.safeDrawing,
+    ) { padding ->
+        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(bottom = 88.dp)) {
+            stickyHeader { TabChips(listOf("All") + regions, region) { region = it } }
+            item {
+                Hint(
+                    "The server uses changes from its next collection, within half an hour. A lean belongs to the outlet, " +
+                        "so all its feeds share it.",
+                    Modifier.padding(20.dp, 4.dp, 20.dp, 12.dp),
+                )
+            }
+            itemsIndexed(shown, key = { _, source -> source.url }) { i, source ->
+                val detail = listOfNotNull(
+                    (source.region ?: "Topics").takeIf { region == "All" },
+                    if (source.lang == "nl") "Dutch" else "English",
+                    source.lean,
+                    "opinion only".takeIf { source.opinion },
+                ).joinToString(" · ")
+                Box(Modifier.padding(horizontal = 16.dp)) {
+                    Segment(i, shown.size, onClick = { editing = source.url }) {
+                        Text(source.name, style = MaterialTheme.typography.bodyLarge)
+                        Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(source.url, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+        }
+    }
+    editing?.let { url -> SourceDialog(settings, settings.sources.find { it.url == url }, region.takeIf { it in regions }, { editing = null }, save) }
+}
+
+@Composable
+private fun SourceDialog(settings: Settings, source: Source?, region: String?, onDismiss: () -> Unit, save: suspend (JSONObject) -> String?) {
+    val dutch = settings.regions.take(3)
+    var name by rememberSaveable { mutableStateOf(source?.name ?: "") }
+    var url by rememberSaveable { mutableStateOf(source?.url ?: "") }
+    var where by rememberSaveable { mutableStateOf(source?.region ?: region ?: "Topics") }
+    var lang by rememberSaveable { mutableStateOf(source?.lang ?: if (where in dutch) "nl" else "en") }
+    var opinion by rememberSaveable { mutableStateOf(source?.opinion ?: false) }
+    // A new feed of an outlet the server already has takes that outlet's lean, unless it's picked here.
+    var picked by rememberSaveable { mutableStateOf(source?.let { it.lean ?: "" }) }
+    val lean = picked ?: settings.sources.find { it.name == name.trim() }?.lean ?: ""
+    EditDialog(
+        title = if (source == null) "New feed" else "Feed",
+        canSave = name.isNotBlank() && url.isNotBlank(),
+        onDismiss = onDismiss,
+        onSave = {
+            val feed = Source(where.takeIf { it != "Topics" }, name.trim(), url.trim(), lang, opinion, lean.ifEmpty { null })
+            val all = if (source == null) settings.sources + feed else settings.sources.map { if (it.url == source.url) feed else it }
+            save(sourcesJson(all.map { if (it.name == feed.name) it.copy(lean = feed.lean) else it }))
+        },
+        onDelete = source?.let { { save(sourcesJson(settings.sources.filter { s -> s.url != it.url })) } },
+    ) {
+        OutlinedTextField(name, { name = it }, label = { Text("Outlet") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(
+            url, { url = it },
+            label = { Text("Feed address") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Choices("Region", (settings.regions + "Topics").map { it to it }, where) {
+            where = it
+            if (source == null) lang = if (it in dutch) "nl" else "en"
+        }
+        Choices("Language", listOf("nl" to "Dutch", "en" to "English"), lang) { lang = it }
+        Choices("Lean", leanNames, lean) { picked = it }
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { opinion = !opinion }) {
+            Checkbox(checked = opinion, onCheckedChange = { opinion = it })
+            Text("Only opinion pieces", style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+@Composable
+fun PromptsScreen(prompts: List<Prompt>, onBack: () -> Unit, onOpen: (String) -> Unit) {
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("Prompts") }, navigationIcon = { BackButton(onBack) }) },
+        contentWindowInsets = WindowInsets.safeDrawing,
+    ) { padding ->
+        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp, 0.dp, 16.dp, 16.dp)) {
+            item {
+                Hint(
+                    "What Claude and Mistral are told. The reply format is added by the server and can't change, so it can " +
+                        "still read the answers.",
+                    Modifier.padding(4.dp, 4.dp, 4.dp, 12.dp),
+                )
+            }
+            itemsIndexed(prompts) { i, prompt ->
+                Row2(prompt.title, if (prompt.text != prompt.default) "Changed" else "As it came", i, prompts.size) { onOpen(prompt.kind) }
+            }
+        }
+    }
+}
+
+@Composable
+fun PromptScreen(prompt: Prompt, onBack: () -> Unit, save: suspend (JSONObject) -> String?) {
+    var text by rememberSaveable(prompt.kind) { mutableStateOf(prompt.text) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(prompt.title) },
+                navigationIcon = { BackButton(onBack) },
+                actions = {
+                    TextButton(onClick = { text = prompt.default }, enabled = text != prompt.default) { Text("Default") }
+                    TextButton(
+                        onClick = {
+                            busy = true
+                            error = null
+                            scope.launch {
+                                error = save(promptJson(prompt.kind, text))
+                                busy = false
+                                if (error == null) onBack()
+                            }
+                        },
+                        enabled = !busy && text != prompt.text,
+                    ) { Text("Save") }
+                },
+            )
+        },
+        contentWindowInsets = WindowInsets.safeDrawing,
+    ) { padding ->
+        Column(Modifier.fillMaxSize().padding(padding).padding(16.dp, 0.dp, 16.dp, 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Hint(prompt.about)
+            error?.let { Banner(it) }
+            OutlinedTextField(text, { text = it }, textStyle = MaterialTheme.typography.bodyMedium, modifier = Modifier.fillMaxWidth().weight(1f))
         }
     }
 }

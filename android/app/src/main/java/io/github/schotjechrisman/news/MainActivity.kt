@@ -48,6 +48,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONException
+import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
     private val state by lazy { NewsState(applicationContext) }
@@ -110,6 +111,11 @@ class NewsState(context: Context) {
         private set
     /** Set when the morning report's notification opens the app. */
     var openReport by mutableStateOf(false)
+    /** The server's settings; null until the settings screen loads them. */
+    var settings by mutableStateOf<Settings?>(null)
+        private set
+    var settingsError by mutableStateOf<String?>(null)
+        private set
 
     fun changeServer(address: String) {
         val trimmed = address.trim().trimEnd('/')
@@ -117,6 +123,8 @@ class NewsState(context: Context) {
         prefs.edit().putString("server", server).apply()
         fetched = 0
         results = null
+        settings = null
+        settingsError = null
     }
 
     suspend fun refresh(staleAfterMinutes: Long = 0) {
@@ -169,15 +177,47 @@ class NewsState(context: Context) {
         }
     }
 
-    private fun explain(e: Exception, server: String) = when (e) {
+    suspend fun loadSettings() {
+        val from = server
+        if (from.isBlank()) return
+        settingsError = null
+        try {
+            val loaded = withContext(Dispatchers.IO) { parseSettings(download(from, "/api/settings", timeout = 20_000)) }
+            if (server == from) settings = loaded
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (server == from) settingsError = explain(e, from, "load the settings")
+        }
+    }
+
+    /** Sends one part of the settings. Returns why it wasn't saved, or null once the server has it. */
+    suspend fun saveSettings(changes: JSONObject): String? {
+        val from = server
+        return try {
+            val saved = withContext(Dispatchers.IO) { parseSettings(upload(from, "/api/settings", changes.toString())) }
+            if (server == from) settings = saved
+            null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            explain(e, from, "save")
+        }
+    }
+
+    private fun explain(e: Exception, server: String, what: String = "load the news") = when (e) {
+        is Refused -> e.message ?: "The server turned the change down."
         is UnknownHostException -> "Can't find $server. Is Tailscale on?"
         is ConnectException, is SocketTimeoutException -> "Can't reach $server."
         is JSONException -> "The server sent something the app can't read."
-        else -> "Couldn't load the news: ${e.message ?: e.javaClass.simpleName}"
+        else -> "Couldn't $what: ${e.message ?: e.javaClass.simpleName}"
     }
 }
 
-enum class Screen { Stories, Story, Report, Search, Feeds, Server }
+enum class Screen { Stories, Story, Report, Search, Feeds, Server, Settings, Interests, Sources, Prompts, Prompt }
+
+/** The settings' own pages, which need the settings loaded. */
+private val settingsPages = setOf(Screen.Interests, Screen.Sources, Screen.Prompts, Screen.Prompt)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -188,6 +228,8 @@ fun App(state: NewsState) {
     var storyFrom by rememberSaveable { mutableStateOf(Screen.Stories) }
     var tab by rememberSaveable { mutableStateOf("All") }
     var query by rememberSaveable { mutableStateOf("") }
+    var promptKind by rememberSaveable { mutableStateOf("") }
+    var serverFrom by rememberSaveable { mutableStateOf(Screen.Settings) }
     // Scroll positions of the main places (one per tab for the news), kept while a story is open or another place shows.
     val lists = remember { mutableMapOf<String, LazyListState>() }
     // Not saved like the others, because the news lists aren't: after a restart both start at the top.
@@ -196,12 +238,32 @@ fun App(state: NewsState) {
     val reportBar = remember { TopAppBarState(-Float.MAX_VALUE, 0f, 0f) }
     val searchList = rememberLazyListState()
     val news = state.news
+    // An interest removed in the settings takes its tab with it.
+    val shownTab = if (news == null || tab == "All" || tab in news.tabs) tab else "All"
     val rail = wide()
     val main = screen == Screen.Stories || screen == Screen.Report || screen == Screen.Search
     val navBar = @Composable { if (!rail) NavBar(screen) { screen = it } }
+    val settings = state.settings
+    // The interests are tabs and the leans color the stories, so the news comes again once they change.
+    val save: suspend (JSONObject) -> String? = { changes ->
+        state.saveSettings(changes).also { if (it == null && !changes.has("budgets") && !changes.has("prompts")) scope.launch { state.refresh() } }
+    }
+    val back = {
+        screen = when (screen) {
+            Screen.Story -> storyFrom
+            Screen.Server -> serverFrom
+            Screen.Interests, Screen.Sources, Screen.Prompts -> Screen.Settings
+            Screen.Prompt -> Screen.Prompts
+            else -> Screen.Stories
+        }
+    }
 
-    BackHandler(enabled = screen != Screen.Stories && state.server.isNotBlank()) {
-        screen = if (screen == Screen.Story) storyFrom else Screen.Stories
+    BackHandler(enabled = screen != Screen.Stories && state.server.isNotBlank()) { back() }
+    // The settings come fresh each time their screen opens. A page of them restored without them (after the system
+    // ended the app) goes back to that screen, which loads them.
+    LaunchedEffect(screen) {
+        if (screen == Screen.Settings) state.loadSettings()
+        if (screen in settingsPages && state.settings == null) screen = Screen.Settings
     }
     LaunchedEffect(state.openReport) {
         if (!state.openReport) return@LaunchedEffect
@@ -224,14 +286,15 @@ fun App(state: NewsState) {
                     news = news,
                     loading = state.loading,
                     error = state.error,
-                    tab = tab,
-                    listState = lists.getOrPut(tab) { LazyListState() },
+                    tab = shownTab,
+                    listState = lists.getOrPut(shownTab) { LazyListState() },
                     barState = newsBar,
                     onTab = { tab = it },
                     onRefresh = { scope.launch { state.refresh() } },
                     onOpen = { storyId = it.id; storyFrom = Screen.Stories; screen = Screen.Story },
                     onFeeds = { screen = Screen.Feeds },
-                    onServer = { screen = Screen.Server },
+                    onSettings = { screen = Screen.Settings },
+                    onServer = { serverFrom = Screen.Stories; screen = Screen.Server },
                     bottomBar = navBar,
                 )
                 Screen.Story -> {
@@ -260,13 +323,31 @@ fun App(state: NewsState) {
                 Screen.Feeds -> FeedsScreen(news?.feeds.orEmpty(), onBack = { screen = Screen.Stories })
                 Screen.Server -> ServerScreen(
                     current = state.server,
-                    onBack = if (state.server.isBlank()) null else ({ screen = Screen.Stories }),
+                    onBack = if (state.server.isBlank()) null else back,
                     onSave = {
                         state.changeServer(it)
                         screen = Screen.Stories
                         scope.launch { state.refresh() }
                     },
                 )
+                Screen.Settings -> SettingsScreen(
+                    server = state.server,
+                    settings = settings,
+                    error = state.settingsError,
+                    onBack = back,
+                    onRetry = { scope.launch { state.loadSettings() } },
+                    onServer = { serverFrom = Screen.Settings; screen = Screen.Server },
+                    onInterests = { screen = Screen.Interests },
+                    onSources = { screen = Screen.Sources },
+                    onPrompts = { screen = Screen.Prompts },
+                    save = save,
+                )
+                Screen.Interests -> settings?.let { InterestsScreen(it.interests, onBack = back, save = save) }
+                Screen.Sources -> settings?.let { SourcesScreen(it, onBack = back, save = save) }
+                Screen.Prompts -> settings?.let {
+                    PromptsScreen(it.prompts, onBack = back, onOpen = { kind -> promptKind = kind; screen = Screen.Prompt })
+                }
+                Screen.Prompt -> settings?.prompts?.find { it.kind == promptKind }?.let { PromptScreen(it, onBack = back, save = save) }
             }
         }
     }

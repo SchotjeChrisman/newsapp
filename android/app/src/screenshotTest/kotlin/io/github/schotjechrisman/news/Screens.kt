@@ -95,7 +95,7 @@ private val news = News(
 fun StoriesPreview() {
     NewsTheme {
         StoriesScreen(news, loading = false, error = null, tab = "All", listState = LazyListState(), barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f),
-            onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onServer = {},
+            onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onSettings = {}, onServer = {},
             bottomBar = { NavBar(Screen.Stories) {} })
     }
 }
@@ -110,7 +110,7 @@ fun StoriesLandscapePreview() {
             Box(Modifier.weight(1f)) {
                 StoriesScreen(news, loading = false, error = null, tab = "All", listState = LazyListState(),
                     barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f), onTab = {}, onRefresh = {}, onOpen = {},
-                    onFeeds = {}, onServer = {}, bottomBar = {})
+                    onFeeds = {}, onSettings = {}, onServer = {}, bottomBar = {})
             }
         }
     }
@@ -123,7 +123,7 @@ fun StoriesLandscapePreview() {
 fun StoriesOfflinePreview() {
     NewsTheme {
         StoriesScreen(news, loading = false, error = "Can't find http://newsbox:8080. Is Tailscale on?", tab = "Zwolle",
-            listState = LazyListState(), barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f), onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onServer = {},
+            listState = LazyListState(), barState = TopAppBarState(-Float.MAX_VALUE, 0f, 0f), onTab = {}, onRefresh = {}, onOpen = {}, onFeeds = {}, onSettings = {}, onServer = {},
             bottomBar = { NavBar(Screen.Stories) {} })
     }
 }
@@ -168,4 +168,77 @@ fun FeedsPreview() {
 @Composable
 fun FirstStartPreview() {
     NewsTheme { ServerScreen(current = "", onBack = null, onSave = {}) }
+}
+
+private val settings = Settings(
+    regions = listOf("Zwolle", "Overijssel", "NL", "EU", "US", "Global"),
+    interests = listOf(
+        Interest("AI", "artificial intelligence: AI models and products, AI companies, chips for AI, AI rules, AI research"),
+        Interest("S&P 500", "the US stock market itself: moves of the S&P 500 and other US indexes, results and share moves of large US-listed companies"),
+        Interest("Football", "association football (soccer) anywhere in the world. Not American football"),
+    ),
+    sources = listOf(
+        Source("Zwolle", "De Stentor", "https://www.destentor.nl/zwolle/rss.xml", "nl", false, null),
+        Source("NL", "NOS", "https://feeds.nos.nl/nosnieuwsalgemeen", "nl", false, "center"),
+        Source("NL", "De Telegraaf", "https://www.telegraaf.nl/rss", "nl", false, "right"),
+        Source("NL", "de Volkskrant opinie", "https://www.volkskrant.nl/opinie/rss.xml", "nl", true, "left"),
+        Source(null, "Ars Technica", "https://feeds.arstechnica.com/arstechnica/index", "en", false, null),
+    ),
+    claudeCap = 50.0,
+    mistralCap = 0.6,
+    prompts = listOf(
+        Prompt("rules", "Writing rules", "Added to the prompts for new stories and for updates.", "Rules:\n- Write English only.", "Rules:\n- Write English only."),
+        Prompt("new", "New stories", "Writes a new story's headline and summary. The writing rules and the reply format are added after it.",
+            "You write the stories for a private news app. Keep it short.", "You write the stories for a private news app."),
+    ),
+)
+
+@PreviewTest
+@Preview(name = "light", widthDp = 400, heightDp = 600)
+@Preview(name = "dark", widthDp = 400, heightDp = 600, uiMode = UI_MODE_NIGHT_YES)
+@Composable
+fun SettingsPreview() {
+    NewsTheme {
+        SettingsScreen("http://newsbox:8080", settings, error = null, onBack = {}, onRetry = {}, onServer = {}, onInterests = {},
+            onSources = {}, onPrompts = {}, save = { null })
+    }
+}
+
+@PreviewTest
+@Preview(name = "light", widthDp = 400, heightDp = 600)
+@Composable
+fun SettingsOfflinePreview() {
+    NewsTheme {
+        SettingsScreen("http://newsbox:8080", null, error = "Can't reach http://newsbox:8080.", onBack = {}, onRetry = {},
+            onServer = {}, onInterests = {}, onSources = {}, onPrompts = {}, save = { null })
+    }
+}
+
+@PreviewTest
+@Preview(name = "light", widthDp = 400, heightDp = 600)
+@Composable
+fun InterestsPreview() {
+    NewsTheme { InterestsScreen(settings.interests, onBack = {}, save = { null }) }
+}
+
+@PreviewTest
+@Preview(name = "light", widthDp = 400, heightDp = 700)
+@Preview(name = "dark", widthDp = 400, heightDp = 700, uiMode = UI_MODE_NIGHT_YES)
+@Composable
+fun SourcesPreview() {
+    NewsTheme { SourcesScreen(settings, onBack = {}, save = { null }) }
+}
+
+@PreviewTest
+@Preview(name = "light", widthDp = 400, heightDp = 500)
+@Composable
+fun PromptsPreview() {
+    NewsTheme { PromptsScreen(settings.prompts, onBack = {}, onOpen = {}) }
+}
+
+@PreviewTest
+@Preview(name = "light", widthDp = 400, heightDp = 600)
+@Composable
+fun PromptPreview() {
+    NewsTheme { PromptScreen(settings.prompts[1], onBack = {}, save = { null }) }
 }
