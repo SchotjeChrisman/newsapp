@@ -254,7 +254,7 @@ def test_write():
 
     def fake(model, system, payload, max_tokens):
         calls.append((system, payload))
-        if system is news.NEW_PROMPT:
+        if system.startswith(news.NEW_PROMPT):
             reply = {"stories": [{"key": "s1", "headline": "Dutch cabinet falls", "summary": "The cabinet fell.", "region": "NL",
                                   "quotes": [{"article": "a3", "quote": "“Het kabinet had geen plan meer”",
                                               "quote_en": "The cabinet had no plan left"},
@@ -282,7 +282,7 @@ def test_write():
 
     add_article(db, 5, 1, "NOS", "Koning aanvaardt ontslag", lang="nl")
     news.write(db)
-    assert calls[-1][0] is news.UPDATE_PROMPT
+    assert calls[-1][0].startswith(news.UPDATE_PROMPT)
     assert [a["title"] for a in calls[-1][1]["stories"][0]["articles"]] == ["Koning aanvaardt ontslag"], \
         "an update only gets the new articles"
     assert db.execute("SELECT headline, summary FROM stories WHERE id = 1").fetchone() == (
@@ -336,8 +336,8 @@ def test_claude_writer():
     calls = []
     news.subprocess.run = lambda cmd, **kw: calls.append(cmd) or Run(json.dumps(
         {"is_error": False, "result": "done", "structured_output": {"ok": 1}, "total_cost_usd": 0.01}))
-    assert news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {}) == ('{"ok": 1}', 0.01)
-    assert json.loads(calls[0][calls[0].index("--json-schema") + 1]) == news.SCHEMAS[news.NEW_PROMPT]
+    assert news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {}, news.SCHEMAS["new"]) == ('{"ok": 1}', 0.01)
+    assert json.loads(calls[0][calls[0].index("--json-schema") + 1]) == news.SCHEMAS["new"]
     assert calls[0][calls[0].index("--tools") + 1] == "", "Claude Code's own tools are off"
     for run, error in ((Run(json.dumps({"is_error": True, "result": "Claude AI usage limit reached"}), 1), news.ClaudeUnavailable),
                        (Run(json.dumps({"is_error": True, "result": "x", "api_error_status": 401}), 1), news.ClaudeUnavailable),
@@ -348,7 +348,7 @@ def test_claude_writer():
                        (Run(json.dumps({"is_error": True, "result": "prompt exceeds the context limit"}), 1), news.ClaudeFailed)):
         news.subprocess.run = lambda cmd, **kw: run
         try:
-            news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {})
+            news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {}, news.SCHEMAS["new"])
             raise AssertionError(f"expected {error.__name__}")
         except error:
             pass
@@ -365,7 +365,7 @@ def test_claude_writer():
         return json.dumps({"stories": [{"key": st["key"], "headline": "H", "summary": "S", "region": "NL"}
                                        for st in payload["stories"]]})
 
-    def claude(model, system, payload):
+    def claude(model, system, payload, schema):
         used.append(model)
         if len(used) == 2:
             raise news.ClaudeUnavailable("Claude AI usage limit reached")
@@ -394,7 +394,7 @@ def test_claude_writer():
     db.commit()
     used.clear()
 
-    def flaky(model, system, payload):
+    def flaky(model, system, payload, schema):
         used.append(model)
         if len(used) == 1:
             raise news.ClaudeFailed("no reply within 10 minutes")
@@ -412,7 +412,7 @@ def test_claude_writer():
     db.commit()
     used.clear()
 
-    def broken(model, system, payload):
+    def broken(model, system, payload, schema):
         used.append(model)
         raise news.ClaudeFailed("unreadable reply")
 
@@ -436,7 +436,7 @@ def test_tag():
         add_article(db, aid, sid, "NOS", f"Article {aid}")
     seen = []
 
-    def unavailable(model, system, payload):
+    def unavailable(model, system, payload, schema):
         raise news.ClaudeUnavailable("usage limit")
 
     def fake(model, system, payload, max_tokens):
@@ -453,7 +453,7 @@ def test_tag():
     news.tag(db)
     assert seen[-1] == ["s1"], "a story is sorted once; one left out is sent again"
 
-    def failing(model, system, payload):
+    def failing(model, system, payload, schema):
         raise news.ClaudeFailed("unreadable reply")
 
     db.execute("UPDATE stories SET interests = NULL")
@@ -464,6 +464,16 @@ def test_tag():
     data = news.api(db)
     assert data["tabs"] == news.REGIONS + list(news.INTERESTS)
     assert {st["id"]: st["tabs"] for st in data["stories"]}[2] == ["AI", "S&P 500"]
+
+    def renamed_meanwhile(model, system, payload, max_tokens):
+        news.save_settings(db, {"interests": [{"name": "Soccer", "about": "association football"}]})
+        return fake(model, system, payload, max_tokens)
+
+    db.execute("UPDATE stories SET interests = NULL")
+    news.call_mistral = renamed_meanwhile
+    news.tag(db)
+    assert db.execute("SELECT COUNT(*) FROM stories WHERE interests IS NOT NULL").fetchone() == (0,), \
+        "tags from interests the app has since changed are thrown away"
     news.call_claude, news.call_mistral = originals
     del os.environ["MISTRAL_API_KEY"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
 
@@ -571,6 +581,80 @@ def test_search():
     assert [st["id"] for st in news.search(db, "mbappe")] == [1], "accents don't matter"
 
 
+def test_settings():
+    db = news.connect()
+    data = news.settings_json(db)
+    assert [s["url"] for s in data["sources"]] == [s["url"] for s in news.load_sources()[0]]
+    assert news.save_settings(db, {"sources": data["sources"]}) is False
+    assert news.setting(db, "sources", None) == {"removed": [], "added": [], "lean": {}}, "the list as it came changes nothing"
+
+    feeds = [s for s in data["sources"] if s["name"] != "GeenStijl"]
+    feeds = [s | {"lean": "left"} if s["name"] == "NOS" else s for s in feeds]
+    feeds.append({"region": None, "name": "Quanta Blog", "url": "https://quanta.example/feed", "lang": "en",
+                  "opinion": False, "lean": "center"})
+    news.save_settings(db, {"sources": feeds})
+    sources, names, _ = news.load_sources(db)
+    assert "GeenStijl" not in {s["name"] for s in sources} and sources[-1]["name"] == "Quanta Blog"
+    news.SOURCES = Path(tempfile.mkdtemp(), "sources.toml")
+    news.SOURCES.write_text(SOURCES.read_text().replace("Topics = [", 'Topics = [\n  { name = "Quanta", url = "https://quanta.example/feed" },', 1))
+    assert [s["name"] for s in news.load_sources(db)[0] if "quanta.example" in s["url"]] == ["Quanta Blog"], \
+        "a feed the app added that sources.toml later lists too is there once, as the app has it"
+    news.SOURCES = SOURCES
+    assert names[news.outlet_key("Quanta Blog")] == "Quanta Blog", "articles are credited to the new feed's outlet"
+    lean = news.leans(db)
+    assert (lean[news.outlet_key("NOS")], lean[news.outlet_key("Quanta Blog")]) == ("left", "center")
+    assert news.leans()[news.outlet_key("NOS")] == "center", "sources.toml itself is untouched"
+    assert all(s["lean"] == "left" for s in news.settings_json(db)["sources"] if s["name"] == "NOS")
+
+    nos = next(s for s in feeds if s["name"] == "NOS")
+    for bad in ([*feeds, nos], [*feeds, nos | {"url": "file:///etc/passwd"}], [*feeds, nos | {"url": "https://nos.nl/x", "region": "Mars"}],
+                [*feeds, nos | {"url": "https://nos.nl/x", "name": "nos.nl"}], [*feeds, nos | {"url": "https://nos.nl/x", "lean": "right"}],
+                [*feeds, "junk"], "junk"):
+        try:
+            news.save_settings(db, {"sources": bad})
+            raise AssertionError(f"accepted {bad if isinstance(bad, str) else bad[-1]}")
+        except ValueError:
+            pass
+    assert news.load_sources(db)[0][-1]["name"] == "Quanta Blog", "a refused change stores nothing"
+
+    t = news.iso(news.now())
+    db.execute("INSERT INTO stories(id, updated, n, headline, interests) VALUES (1, ?, 1, 'H', '[\"AI\"]')", (t,))
+    assert news.save_settings(db, {"interests": [{"name": "Politics", "about": "elections and governments"}]}) is True
+    assert news.api(db)["tabs"] == news.REGIONS + ["Politics"]
+    assert "- Politics: elections and governments" in news.system_prompt(db, "tag")
+    assert news.reply_schema(db, "tag")["properties"]["stories"]["items"]["properties"]["interests"]["items"]["enum"] == ["Politics"]
+    assert db.execute("SELECT interests FROM stories").fetchone() == (None,), "recent stories are sorted again"
+    for bad in ([{"name": "AI", "about": "x"}, {"name": "ai", "about": "y"}], [{"name": "NL", "about": "x"}],
+                [{"name": "Film", "about": " "}], [{"name": "!!", "about": "x"}], {"name": "Film"}):
+        try:
+            news.save_settings(db, {"interests": bad})
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+
+    news.save_settings(db, {"budgets": {"claude": 5, "mistral": 0}})
+    assert news.budgets(db) == {"claude": 5.0, "mistral": 0.0}
+    for bad in ({"claude": -1, "mistral": 0}, {"claude": float("nan"), "mistral": 0}, {"claude": "5", "mistral": 0}, {"claude": 5}):
+        try:
+            news.save_settings(db, {"budgets": bad})
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+
+    news.save_settings(db, {"prompts": {"rules": "Rules: be brief.", "report": news.REPORT_PROMPT + "\n"}})
+    new = news.system_prompt(db, "new")
+    assert new.startswith(news.NEW_PROMPT + "\nRules: be brief.\n") and new.endswith(news.FORMATS["new"])
+    assert news.setting(db, "prompts", None) == {"rules": "Rules: be brief."}, "a prompt set back to its default isn't stored"
+    news.save_settings(db, {"prompts": {"rules": ""}})
+    assert news.system_prompt(db, "new") == "\n".join([news.NEW_PROMPT, news.RULES, news.FORMATS["new"]])
+    for bad in ({"prompts": {"secret": "x"}}, {"prompts": "x"}, {"threshold": 0.5}, []):
+        try:
+            news.save_settings(db, bad)
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+
+
 def test_http():
     server = news.ThreadingHTTPServer(("127.0.0.1", 0), news.Page)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -589,6 +673,36 @@ def test_http():
         raise AssertionError("unknown paths are not found")
     except urllib.error.HTTPError as e:
         assert e.code == 404
+    with urllib.request.urlopen(base + "/api/settings") as r:
+        assert json.loads(r.read())["budgets"] == {"claude": news.CLAUDE_DAILY_BUDGET, "mistral": news.DAILY_BUDGET}
+
+    def post(body, kind="application/json"):
+        request = urllib.request.Request(base + "/api/settings", body, {"Content-Type": kind})
+        try:
+            with urllib.request.urlopen(request) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    status, data = post(b'{"budgets": {"claude": 7, "mistral": 1}}')
+    assert status == 200 and data["budgets"] == {"claude": 7.0, "mistral": 1.0}
+    status, data = post(b'{"budgets": {"claude": -7, "mistral": 1}}')
+    assert status == 400 and json.loads(data)["error"].startswith("A spending cap")
+    assert post(b"{not json")[0] == 400
+    assert post(b'{"budgets": {"claude": 1' + b"0" * 400 + b', "mistral": 1}}')[0] == 400
+    assert post(b"[" * 100_000)[0] == 400
+    with tempfile.TemporaryDirectory() as tmp:
+        news.DB = str(Path(tmp, "news.db"))
+        busy = news.connect()
+        busy.execute("UPDATE stories SET n = 0")  # a write transaction the processing run holds
+        started = time.monotonic()
+        status, data = post(b'{"budgets": {"claude": 7, "mistral": 1}}')
+        assert status == 503 and b"busy" in data and time.monotonic() - started < 15, "a busy server says so in time"
+        busy.rollback()
+        assert post(b'{"budgets": {"claude": 7, "mistral": 1}}')[0] == 200
+        busy.close()
+        news.DB = ":memory:"
+    assert post(b'{"budgets": {"claude": 7, "mistral": 1}}', "text/plain")[0] == 415, "what a web page can send unasked"
     server.shutdown()
 
 
@@ -607,5 +721,6 @@ test_claude_writer()
 test_tag()
 test_morning()
 test_search()
+test_settings()
 test_http()
 print("ok")

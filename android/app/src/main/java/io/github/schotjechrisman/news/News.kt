@@ -62,6 +62,26 @@ data class News(
     val report: Report?,
 )
 
+data class Interest(val name: String, val about: String)
+
+/** A feed the server collects; region null is Topics. The lean belongs to the outlet, so its feeds share it. */
+data class Source(val region: String?, val name: String, val url: String, val lang: String, val opinion: Boolean, val lean: String?)
+
+data class Prompt(val kind: String, val title: String, val about: String, val text: String, val default: String)
+
+/** What the server lets the app change; the caps are dollars a day. */
+data class Settings(
+    val regions: List<String>,
+    val interests: List<Interest>,
+    val sources: List<Source>,
+    val claudeCap: Double,
+    val mistralCap: Double,
+    val prompts: List<Prompt>,
+)
+
+/** The server turned a change down or couldn't make it; the message says why. */
+class Refused(message: String) : IOException(message)
+
 /** A document from the server: the whole news (/api/stories) or the morning report (/api/report).
  *  HttpURLConnection asks for gzip and unpacks it by itself. */
 fun download(server: String, path: String = "/api/stories", timeout: Int = 60_000): String {
@@ -70,6 +90,27 @@ fun download(server: String, path: String = "/api/stories", timeout: Int = 60_00
     connection.readTimeout = timeout
     try {
         if (connection.responseCode != 200) throw IOException("the server answered ${connection.responseCode}")
+        return connection.inputStream.bufferedReader().use { it.readText() }
+    } finally {
+        connection.disconnect()
+    }
+}
+
+/** Sends a JSON document and returns the server's answer. */
+fun upload(server: String, path: String, json: String, timeout: Int = 30_000): String {
+    val connection = URL("${server.trimEnd('/')}$path").openConnection() as HttpURLConnection
+    connection.connectTimeout = minOf(15_000, timeout)
+    connection.readTimeout = timeout
+    connection.requestMethod = "POST"
+    connection.doOutput = true
+    connection.setRequestProperty("Content-Type", "application/json")
+    try {
+        connection.outputStream.use { it.write(json.toByteArray()) }
+        val code = connection.responseCode
+        if (code != 200) {
+            val why = runCatching { JSONObject(connection.errorStream.bufferedReader().use { it.readText() }).getString("error") }
+            throw why.map { Refused(it) }.getOrElse { IOException("the server answered $code") }
+        }
         return connection.inputStream.bufferedReader().use { it.readText() }
     } finally {
         connection.disconnect()
@@ -136,6 +177,38 @@ private fun report(r: JSONObject) = Report(
         })
     },
 )
+
+fun parseSettings(json: String): Settings {
+    val root = JSONObject(json)
+    val caps = root.getJSONObject("budgets")
+    return Settings(
+        regions = root.getJSONArray("regions").strings(),
+        interests = root.getJSONArray("interests").objects().map { Interest(it.getString("name"), it.getString("about")) },
+        sources = root.getJSONArray("sources").objects().map {
+            Source(it.text("region"), it.getString("name"), it.getString("url"), it.getString("lang"), it.getBoolean("opinion"), it.text("lean"))
+        },
+        claudeCap = caps.getDouble("claude"),
+        mistralCap = caps.getDouble("mistral"),
+        prompts = root.getJSONArray("prompts").objects().map {
+            Prompt(it.getString("kind"), it.getString("title"), it.getString("about"), it.getString("text"), it.getString("default"))
+        },
+    )
+}
+
+// The parts of the settings as the server takes them; each is sent on its own, whole.
+
+fun interestsJson(interests: List<Interest>): JSONObject =
+    JSONObject().put("interests", JSONArray(interests.map { JSONObject().put("name", it.name).put("about", it.about) }))
+
+fun sourcesJson(sources: List<Source>): JSONObject = JSONObject().put("sources", JSONArray(sources.map {
+    JSONObject().put("region", it.region ?: JSONObject.NULL).put("name", it.name).put("url", it.url).put("lang", it.lang)
+        .put("opinion", it.opinion).put("lean", it.lean ?: JSONObject.NULL)
+}))
+
+fun capsJson(claude: Double, mistral: Double): JSONObject =
+    JSONObject().put("budgets", JSONObject().put("claude", claude).put("mistral", mistral))
+
+fun promptJson(kind: String, text: String): JSONObject = JSONObject().put("prompts", JSONObject().put(kind, text))
 
 private fun time(iso: String): Instant = OffsetDateTime.parse(iso).toInstant()
 
