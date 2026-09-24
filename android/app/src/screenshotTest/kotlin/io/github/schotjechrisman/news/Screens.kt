@@ -26,6 +26,8 @@ private val iran = Story(
         "with Iran or \"annihilate the Islamic Republic.\" Most of Iran's delegation walked out during his speech. " +
         "Iran's Armed Forces dismissed his comments as \"propaganda.\"",
     tabs = listOf("Global"),
+    coverage = 20.0,
+    lift = emptyMap(),
     sources = 28,
     updated = hoursAgo(1),
     lean = Lean(6, 12, 7),
