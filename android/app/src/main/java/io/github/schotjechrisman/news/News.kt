@@ -64,6 +64,10 @@ data class News(
 
 data class Interest(val name: String, val about: String)
 
+/** A place tab. major: the independent sources a story needs for the morning report. was: its name on the server, null
+ *  for a new one, so the server can move its feeds and stories along when it's renamed. */
+data class Place(val name: String, val about: String, val major: Int, val was: String?)
+
 /** A feed the server collects; region null is Topics. The lean belongs to the outlet, so its feeds share it. */
 data class Source(val region: String?, val name: String, val url: String, val lang: String, val opinion: Boolean, val lean: String?)
 
@@ -72,6 +76,7 @@ data class Prompt(val kind: String, val title: String, val about: String, val te
 /** What the server lets the app change; the caps are dollars a day. */
 data class Settings(
     val regions: List<String>,
+    val places: List<Place>,
     val interests: List<Interest>,
     val sources: List<Source>,
     val claudeCap: Double,
@@ -183,6 +188,9 @@ fun parseSettings(json: String): Settings {
     val caps = root.getJSONObject("budgets")
     return Settings(
         regions = root.getJSONArray("regions").strings(),
+        places = root.optJSONArray("places")?.objects()?.map {
+            Place(it.getString("name"), it.getString("about"), it.getInt("major"), it.getString("name"))
+        }.orEmpty(),
         interests = root.getJSONArray("interests").objects().map { Interest(it.getString("name"), it.getString("about")) },
         sources = root.getJSONArray("sources").objects().map {
             Source(it.text("region"), it.getString("name"), it.getString("url"), it.getString("lang"), it.getBoolean("opinion"), it.text("lean"))
@@ -196,6 +204,10 @@ fun parseSettings(json: String): Settings {
 }
 
 // The parts of the settings as the server takes them; each is sent on its own, whole.
+
+fun placesJson(places: List<Place>): JSONObject = JSONObject().put("places", JSONArray(places.map {
+    JSONObject().put("name", it.name).put("about", it.about).put("major", it.major).put("was", it.was ?: JSONObject.NULL)
+}))
 
 fun interestsJson(interests: List<Interest>): JSONObject =
     JSONObject().put("interests", JSONArray(interests.map { JSONObject().put("name", it.name).put("about", it.about) }))

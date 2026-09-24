@@ -867,7 +867,7 @@ fun SettingsScreen(
             } else {
                 val changed = settings.prompts.count { it.text != it.default }
                 val rows = listOf(
-                    Triple("Interests", settings.interests.joinToString(", ") { it.name }.ifEmpty { "None" }, onInterests),
+                    Triple("Interests", (settings.places.map { it.name } + settings.interests.map { it.name }).joinToString(", ").ifEmpty { "None" }, onInterests),
                     Triple("News sources", plural(settings.sources.size, "feed"), onSources),
                     Triple("Spending caps", "Claude ${dollars(settings.claudeCap)}, Mistral ${dollars(settings.mistralCap)} a day") { caps = true },
                     Triple("Prompts", if (changed == 0) "As they came" else "$changed changed", onPrompts),
@@ -950,46 +950,79 @@ private fun CapsDialog(settings: Settings, onDismiss: () -> Unit, save: suspend 
 }
 
 @Composable
-fun InterestsScreen(interests: List<Interest>, onBack: () -> Unit, save: suspend (JSONObject) -> String?) {
-    // The one being changed: its place in the list, or -1 for a new one.
-    var editing by rememberSaveable { mutableStateOf<Int?>(null) }
+fun InterestsScreen(places: List<Place>, interests: List<Interest>, onBack: () -> Unit, save: suspend (JSONObject) -> String?) {
+    // The one being changed: its place in its list, or -1 for a new one.
+    var place by rememberSaveable { mutableStateOf<Int?>(null) }
+    var interest by rememberSaveable { mutableStateOf<Int?>(null) }
     Scaffold(
         topBar = { TopAppBar(title = { Text("Interests") }, navigationIcon = { BackButton(onBack) }) },
-        floatingActionButton = { ExtendedFloatingActionButton(onClick = { editing = -1 }) { Text("Add interest") } },
         contentWindowInsets = WindowInsets.safeDrawing,
     ) { padding ->
-        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp, 0.dp, 16.dp, 88.dp)) {
+        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp, 0.dp, 16.dp, 16.dp)) {
             item {
                 Hint(
-                    "Each interest is a tab and a part of the morning report. Claude sorts stories into them by their " +
-                        "descriptions. After a change, the stories of the last two days are sorted again, which takes a few minutes.",
-                    Modifier.padding(4.dp, 4.dp, 4.dp, 12.dp),
+                    "Each one is a tab and a part of the morning report. Claude files a new story under the most specific " +
+                        "place it's about, and sorts stories into the subjects by their descriptions.",
+                    Modifier.padding(4.dp, 4.dp, 4.dp, 4.dp),
                 )
             }
-            itemsIndexed(interests) { i, interest -> Row2(interest.name, interest.about, i, interests.size) { editing = i } }
+            item { SectionLabel("Places", Modifier.padding(4.dp, 20.dp, 4.dp, 8.dp)) }
+            itemsIndexed(places) { i, p -> Row2(p.name, p.about, i, places.size) { place = i } }
+            item { OutlinedButton(onClick = { place = -1 }, modifier = Modifier.padding(top = 8.dp)) { Text("Add place") } }
+            item { SectionLabel("Subjects", Modifier.padding(4.dp, 24.dp, 4.dp, 8.dp)) }
+            itemsIndexed(interests) { i, it -> Row2(it.name, it.about, i, interests.size) { interest = i } }
+            item { OutlinedButton(onClick = { interest = -1 }, modifier = Modifier.padding(top = 8.dp)) { Text("Add subject") } }
         }
     }
-    editing?.let { i ->
-        val interest = interests.getOrNull(i)
-        var name by rememberSaveable(i) { mutableStateOf(interest?.name ?: "") }
-        var about by rememberSaveable(i) { mutableStateOf(interest?.about ?: "") }
+    place?.let { i ->
+        val current = places.getOrNull(i)
+        var name by rememberSaveable(i) { mutableStateOf(current?.name ?: "") }
+        var about by rememberSaveable(i) { mutableStateOf(current?.about ?: "") }
+        var major by rememberSaveable(i) { mutableStateOf(current?.major?.toString() ?: "3") }
+        val sources = major.trim().toIntOrNull()?.takeIf { it in 1..1000 }
         EditDialog(
-            title = if (interest == null) "New interest" else "Interest",
-            canSave = name.isNotBlank() && about.isNotBlank(),
-            onDismiss = { editing = null },
+            title = if (current == null) "New place" else "Place",
+            canSave = name.isNotBlank() && about.isNotBlank() && sources != null,
+            onDismiss = { place = null },
             onSave = {
-                val changed = Interest(name.trim(), about.trim())
-                save(interestsJson(if (interest == null) interests + changed else interests.map { if (it == interest) changed else it }))
+                val changed = Place(name.trim(), about.trim(), sources!!, current?.was)
+                save(placesJson(if (current == null) places + changed else places.map { if (it == current) changed else it }))
             },
-            onDelete = interest?.let { { save(interestsJson(interests - it)) } },
+            onDelete = current?.let { { save(placesJson(places - it)) } },
         ) {
             OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(about, { about = it }, label = { Text("What belongs in it") }, minLines = 2, modifier = Modifier.fillMaxWidth())
             OutlinedTextField(
-                about, { about = it },
-                label = { Text("What belongs in it") },
-                minLines = 3,
+                major, { major = it },
+                label = { Text("Sources a story needs for the morning report") },
+                isError = sources == null,
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(),
             )
+            Hint(
+                if (current == null) "Stories written from now on can be filed here."
+                else "Renaming keeps its feeds and stories. Deleting moves its feeds to Topics.",
+            )
+        }
+    }
+    interest?.let { i ->
+        val current = interests.getOrNull(i)
+        var name by rememberSaveable(i) { mutableStateOf(current?.name ?: "") }
+        var about by rememberSaveable(i) { mutableStateOf(current?.about ?: "") }
+        EditDialog(
+            title = if (current == null) "New subject" else "Subject",
+            canSave = name.isNotBlank() && about.isNotBlank(),
+            onDismiss = { interest = null },
+            onSave = {
+                val changed = Interest(name.trim(), about.trim())
+                save(interestsJson(if (current == null) interests + changed else interests.map { if (it == current) changed else it }))
+            },
+            onDelete = current?.let { { save(interestsJson(interests - it)) } },
+        ) {
+            OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(about, { about = it }, label = { Text("What belongs in it") }, minLines = 3, modifier = Modifier.fillMaxWidth())
+            Hint("After a change, the stories of the last two days are sorted again, which takes a few minutes.")
         }
     }
 }
@@ -1049,11 +1082,13 @@ fun SourcesScreen(settings: Settings, onBack: () -> Unit, save: suspend (JSONObj
 
 @Composable
 private fun SourceDialog(settings: Settings, source: Source?, region: String?, onDismiss: () -> Unit, save: suspend (JSONObject) -> String?) {
-    val dutch = settings.regions.take(3)
+    // A new feed's language follows what most of its place's feeds are in.
+    fun language(region: String) =
+        settings.sources.filter { (it.region ?: "Topics") == region }.groupingBy { it.lang }.eachCount().maxByOrNull { it.value }?.key ?: "en"
     var name by rememberSaveable { mutableStateOf(source?.name ?: "") }
     var url by rememberSaveable { mutableStateOf(source?.url ?: "") }
     var where by rememberSaveable { mutableStateOf(source?.region ?: region ?: "Topics") }
-    var lang by rememberSaveable { mutableStateOf(source?.lang ?: if (where in dutch) "nl" else "en") }
+    var lang by rememberSaveable { mutableStateOf(source?.lang ?: language(where)) }
     var opinion by rememberSaveable { mutableStateOf(source?.opinion ?: false) }
     // A new feed of an outlet the server already has takes that outlet's lean, unless it's picked here.
     var picked by rememberSaveable { mutableStateOf(source?.let { it.lean ?: "" }) }
@@ -1079,7 +1114,7 @@ private fun SourceDialog(settings: Settings, source: Source?, region: String?, o
         )
         Choices("Region", (settings.regions + "Topics").map { it to it }, where) {
             where = it
-            if (source == null) lang = if (it in dutch) "nl" else "en"
+            if (source == null) lang = language(it)
         }
         Choices("Language", listOf("nl" to "Dutch", "en" to "English"), lang) { lang = it }
         Choices("Lean", leanNames, lean) { picked = it }
