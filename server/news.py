@@ -5,6 +5,7 @@ import email.utils
 import fnmatch
 import gzip
 import html
+import copy
 import http.client
 import json
 import os
@@ -40,8 +41,6 @@ COLLECT_WITHIN = 120  # seconds for all feeds together
 # Grouping and writing run every 3 hours at fixed local times, one of them at REPORT_HOUR; the morning report is built
 # right after that run, and the app notifies at 05:30.
 REPORT_HOUR = 5
-# A story is major for its region's part of the morning report with at least this many independent sources.
-MAJOR = {"Zwolle": 2, "Overijssel": 2, "NL": 5, "EU": 6, "US": 8, "Global": 10}
 REPORT_PER_REGION = 5
 REPORT_PER_INTEREST = 3
 # The S&P 500's last close: CNBC's quote service, Yahoo's chart API when CNBC doesn't answer (Yahoo rate-limits often).
@@ -56,10 +55,21 @@ OPINION = re.compile(r"/(columns?-opinie|opinie|opinions?|columns?|commentisfree
 # Google News links hide the section, so its opinion pieces are recognized by the label in the headline.
 OPINION_TITLE = re.compile(r"^(opinion|opinie|column)\s*[|:]|\|\s*(opinion|opinie|column)\s*$", re.I)
 TAG = re.compile(r"<[^>]+>")
-REGIONS = ["Zwolle", "Overijssel", "NL", "EU", "US", "Global"]
+# The places, each a tab and a part of the morning report: what belongs in it (the writer files a story under the most
+# specific place it's about), and how many independent sources make a story major enough for the report. The feeds in
+# sources.toml are grouped by these names. The app's settings can change them, like the interests below.
+PLACES = {
+    "Zwolle": {"about": "the city of Zwolle", "major": 2},
+    "Overijssel": {"about": "the province of Overijssel outside Zwolle", "major": 2},
+    "NL": {"about": "the Netherlands outside Overijssel, or the country as a whole", "major": 5},
+    "EU": {"about": "EU institutions, or European countries other than the Netherlands", "major": 6},
+    "US": {"about": "the United States", "major": 8},
+    "Global": {"about": "anywhere else, or the world as a whole", "major": 10},
+}
+REGIONS = list(PLACES)
 DUTCH_REGIONS = {"Zwolle", "Overijssel", "NL"}  # sources there write Dutch unless sources.toml says otherwise
 # The reader's interests, each a tab in the app; the description tells the model what belongs in it. The app's settings
-# can replace them, like the spending caps below, the prompts and the feeds.
+# can replace them, like the places above, the spending caps below, the prompts and the feeds.
 INTERESTS = {
     "AI": "artificial intelligence: AI models and products, AI companies, chips for AI, AI rules, AI research",
     "Tech": "technology: tech companies, software, apps, gadgets, the internet, telecom, cybersecurity",
@@ -132,9 +142,19 @@ def setting(db, key, default):
     return json.loads(row[0]) if row else default
 
 
+def places(db):
+    """The places, name -> {"about", "major"}."""
+    return setting(db, "places", PLACES)
+
+
 def interests(db):
     """The reader's interests, name -> what belongs in it."""
     return setting(db, "interests", INTERESTS)
+
+
+def fold(name):
+    """A tab name as the server compares them: letters and digits only, any case."""
+    return re.sub(r"\W", "", name).casefold()
 
 
 def budgets(db):
@@ -148,18 +168,23 @@ def outlet_key(name):
     return re.sub(r"^(www\.|w3\.)|\.(com|nl|org|net|co\.uk)$|^(the|de|het) ", "", name).replace(" ", "")
 
 
-def load_sources(db=None):
+def load_sources(db=None, edited=True):
     """sources.toml holds one array per region (Topics: outlets without a region), outlet aliases, ignored outlets
-    and the outlets' lean. With db, the feeds the app's settings removed and added count too."""
+    and the outlets' lean. With db, the places the app renamed or deleted apply (a deleted place's feeds have no
+    region), and unless edited is False, so do the feeds it removed and added."""
     data = tomllib.loads(SOURCES.read_text())
     aliases, ignore = data.pop("aliases", {}), data.pop("ignore", [])
     data.pop("lean", None)
-    edits = setting(db, "sources", {}) if db is not None else {}
+    edits = setting(db, "sources", {}) if db is not None and edited else {}
+    renamed = setting(db, "renamed", {}) if db is not None else {}
     # A feed the app added that sources.toml later lists too: the app's version counts.
     removed = set(edits.get("removed", [])) | {s["url"] for s in edits.get("added", [])}
-    sources = [s | {"region": None if region == "Topics" else region,
+    sources = [s | {"region": renamed.get(region, region) if region != "Topics" else None,
                     "lang": s.get("lang", "nl" if region in DUTCH_REGIONS else "en"), "opinion": s.get("opinion", False)}
                for region, items in data.items() for s in items if s["url"] not in removed] + edits.get("added", [])
+    if db is not None:
+        known = places(db)
+        sources = [s if s["region"] in known else s | {"region": None} for s in sources]
     names = {outlet_key(s["name"]): s["name"] for s in sources} | {outlet_key(a): n for a, n in aliases.items()}
     return sources, names, ignore
 
@@ -518,9 +543,8 @@ possibly in Dutch. For every story write:
 - headline: neutral and factual, at most 14 words.
 - summary: what happened, as far as the articles tell it. One sentence when they give little more than a headline;
   never more than 4 sentences or 90 words. Short beats padded.
-- region: the most specific place the story is about. One of: Zwolle (the city of Zwolle), Overijssel (elsewhere in the
-  province), NL (elsewhere in the Netherlands, or national), EU (EU institutions or other European countries), US,
-  Global (anywhere else, or worldwide), or None when it is about no place (a product launch, a study, an album)."""
+- region: the most specific place the story is about, from the places below, or None when it is about no place (a
+  product launch, a study, an album)."""
 
 UPDATE_PROMPT = """You keep a running story in a private news app up to date. You get its current text (headline,
 summary, earlier updates) and new articles. For each new article that states something the current text doesn't have
@@ -545,7 +569,8 @@ PROMPTS = {"translate": TRANSLATE_PROMPT, "rules": RULES, "new": NEW_PROMPT, "up
 PROMPT_NOTES = {
     "translate": ("Translation", "Mistral turns Dutch headlines and teasers into English. The reply format is added after it."),
     "rules": ("Writing rules", "Added to the prompts for new stories and for updates."),
-    "new": ("New stories", "Writes a new story's headline and summary. The writing rules and the reply format are added after it."),
+    "new": ("New stories", "Writes a new story's headline and summary. The places, the writing rules and the reply format are "
+                           "added after it."),
     "update": ("Updates", "Adds a sentence to a story for each new article. The writing rules and the reply format are added "
                           "after it."),
     "tag": ("Interests", "Sorts stories into your interests. The interests and the reply format are added after it."),
@@ -581,10 +606,12 @@ SCHEMAS = {
 
 
 def system_prompt(db, kind):
-    """A prompt as the model gets it: its text (the app's when it changed it), then the writing rules or the interests
-    where they belong, then the reply format."""
+    """A prompt as the model gets it: its text (the app's when it changed it), then the places, the writing rules or the
+    interests where they belong, then the reply format."""
     edited = setting(db, "prompts", {})
     parts = [edited.get(kind) or PROMPTS[kind]]
+    if kind == "new":
+        parts.append("Places:\n" + "\n".join(f"- {name}: {place['about']}" for name, place in places(db).items()))
     if kind in ("new", "update"):
         parts.append(edited.get("rules") or RULES)
     if kind == "tag":
@@ -593,7 +620,11 @@ def system_prompt(db, kind):
 
 
 def reply_schema(db, kind):
-    """What Claude Code checks a reply against; the interests can change, so theirs is made here."""
+    """What Claude Code checks a reply against; the places and interests can change, so their names go in here."""
+    if kind == "new":
+        schema = copy.deepcopy(SCHEMAS["new"])
+        schema["properties"]["stories"]["items"]["properties"]["region"] = {"enum": list(places(db)) + ["None"]}
+        return schema
     if kind != "tag":
         return SCHEMAS[kind]
     return {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
@@ -725,6 +756,7 @@ def write(db):
                         if not writers:
                             raise OverBudget("no writer available") from e
                 items = result.get("stories") if isinstance(result, dict) else None
+                known = places(db)  # as they are now: the app may have renamed one while the model was writing
                 for item in items if isinstance(items, list) else []:
                     key = item.get("key") if isinstance(item, dict) else None
                     st, articles = keyed.pop(key, (None, None)) if isinstance(key, str) else (None, None)
@@ -734,7 +766,7 @@ def write(db):
                         headline, summary = str(item.get("headline") or "").strip(), str(item.get("summary") or "").strip()
                         if not headline or not summary:
                             continue
-                        region = item.get("region") if item.get("region") in REGIONS else None
+                        region = item.get("region") if isinstance(item.get("region"), str) and item["region"] in known else None
                         db.execute("UPDATE stories SET headline = ?, summary = ?, region = ?, summary_articles = ? WHERE id = ?",
                                    (headline, summary, region, json.dumps(st["ids"]), st["id"]))
                         written += 1
@@ -877,8 +909,8 @@ def morning(db, t=None):
     since = iso(datetime.combine(end.date() - timedelta(days=1), clock(REPORT_HOUR)).astimezone())
     stories = [s for s in shown(db) if s["headline"] and any(a[5] >= since for a in s["arts"])]
     sections, picked = [], set()
-    for region in REGIONS:
-        major = [s for s in stories if region in s["regions"] and s["sources"] >= MAJOR[region]][:REPORT_PER_REGION]
+    for region, place in places(db).items():
+        major = [s for s in stories if region in s["regions"] and s["sources"] >= place["major"]][:REPORT_PER_REGION]
         sections.append((region, major))
         picked |= {s["id"] for s in major}
     for interest in interests(db):
@@ -996,7 +1028,7 @@ def story_html(s):
             f'<li><q>{esc(quote_en)}</q> <span class="from">{esc(outlet)}'
             f'{", translated" if normalized(quote) != normalized(quote_en) else ""} {link(url, "Source", "source")}</span></li>'
             for quote, quote_en, outlet, url in s["quotes"]) + "</ul>"
-    return (f'<article class="story" data-r="{esc(" ".join(s["regions"]))}"><div class="count"><b>{sources}</b>'
+    return (f'<article class="story" data-r="{esc("|".join(s["regions"]))}"><div class="count"><b>{sources}</b>'
             f'<span>{"sources" if sources > 1 else "source"}</span></div>'
             f'<div>{body}<ul class="articles">{items}</ul></div></article>')
 
@@ -1050,9 +1082,9 @@ def render(db):
     sources = db.execute("SELECT name, url, items, error FROM sources ORDER BY error IS NULL, name").fetchall()
     failing = [s for s in sources if s[3]]
     chips = f'<button type="button" data-filter="All" aria-pressed="true">All <span>{len(multi)}</span></button>'
-    for r in REGIONS:
+    for r in places(db):
         n = sum(1 for s in multi if r in s["regions"])
-        chips += f'<button type="button" data-filter="{r}" aria-pressed="false">{r} <span>{n}</span></button>'
+        chips += f'<button type="button" data-filter="{esc(r)}" aria-pressed="false">{esc(r)} <span>{n}</span></button>'
     source_rows = "".join(
         f'<tr class="{"bad" if e else ""}"><td><a href="{esc(u)}" target="_blank" rel="noreferrer">{esc(n)}</a></td>'
         f'<td class="num">{i}</td><td>{esc(e or "ok")}</td></tr>' for n, u, i, e in sources)
@@ -1159,7 +1191,7 @@ chips.forEach(chip => chip.addEventListener("click", () => {{
   const region = chip.dataset.filter;
   chips.forEach(c => c.setAttribute("aria-pressed", c === chip));
   document.querySelectorAll(".story").forEach(s => {{
-    s.hidden = region !== "All" && !s.dataset.r.split(" ").includes(region);
+    s.hidden = region !== "All" && !s.dataset.r.split("|").includes(region);
   }});
 }}));
 const toggle = document.getElementById("show-singles"), singles = document.getElementById("singles");
@@ -1229,7 +1261,7 @@ def api(db):
     stories = [story_json(s, lean) for s in shown(db)]
     feeds = [{"name": name, "url": url, "items": items, "error": error, "checked": checked} for name, url, items, error, checked
              in db.execute("SELECT name, url, items, error, checked FROM sources ORDER BY error IS NULL, name")]
-    return {"built": iso(now()), "tabs": REGIONS + list(interests(db)), "stories": stories, "feeds": feeds,
+    return {"built": iso(now()), "tabs": list(places(db)) + list(interests(db)), "stories": stories, "feeds": feeds,
             "report": latest_report(db)}
 
 
@@ -1237,7 +1269,8 @@ def settings_json(db):
     """What the app's settings show: the interests, the feeds with their outlet's lean, the spending caps and the prompts."""
     lean, edited = leans(db), setting(db, "prompts", {})
     return {
-        "regions": REGIONS,
+        "regions": list(places(db)),
+        "places": [{"name": name, "about": place["about"], "major": place["major"]} for name, place in places(db).items()],
         "interests": [{"name": name, "about": about} for name, about in interests(db).items()],
         "sources": [{"region": s["region"], "name": s["name"], "url": s["url"], "lang": s["lang"], "opinion": s["opinion"],
                      "lean": lean.get(outlet_key(s["name"]))} for s in load_sources(db)[0]],
@@ -1255,26 +1288,65 @@ def field(item, key):
 def save_settings(db, changes):
     """Checks and stores the parts of the settings the app sends; a ValueError's message is shown in the app. Returns
     whether the interests changed: the recent stories are then sorted again."""
-    if not isinstance(changes, dict) or not set(changes) <= {"interests", "sources", "budgets", "prompts"}:
+    if not isinstance(changes, dict) or not set(changes) <= {"places", "interests", "sources", "budgets", "prompts"}:
         raise ValueError("The app sent settings the server doesn't know.")
-    new, before = {}, interests(db)
+    if "places" in changes and "sources" in changes:
+        raise ValueError("Save the places and the feeds one at a time.")
+    new, before, where = {}, interests(db), places(db)
+    moves = {}  # old place -> its new name, or None when it's gone
+    if "places" in changes:
+        found = {}
+        for item in changes["places"] if isinstance(changes["places"], list) else [None]:
+            name, about = field(item, "name"), field(item, "about")
+            major, was = (item.get("major"), item.get("was")) if isinstance(item, dict) else (None, None)
+            if not fold(name) or not about:
+                raise ValueError("Each place needs a name and a description.")
+            if len(name) > 40 or len(about) > 1000:
+                raise ValueError(f"{name[:40]}: keep the name under 40 characters and the description under 1000.")
+            if isinstance(major, bool) or not isinstance(major, int) or not 1 <= major <= 1000:
+                raise ValueError(f"{name}: the morning report needs a number of sources from 1 to 1000.")
+            if name in found:
+                raise ValueError(f"There's already a tab called {name}.")
+            if was is not None and (not isinstance(was, str) or was not in where or was in moves):
+                raise ValueError("The app sent a place the server doesn't know.")
+            if was is not None:
+                moves[was] = name
+            found[name] = {"about": about, "major": major}
+        moves = {old: name for old, name in (moves | {old: None for old in where if old not in moves}).items() if old != name}
+        new["places"] = found
     if "interests" in changes:
-        # tag() matches the model's answers on letters and digits only, and the tabs can't have the same name twice.
-        found, taken = {}, {re.sub(r"\W", "", tab).casefold() for tab in REGIONS + ["All"]}
+        found = {}
         for item in changes["interests"] if isinstance(changes["interests"], list) else [None]:
             name, about = field(item, "name"), field(item, "about")
-            key = re.sub(r"\W", "", name).casefold()
-            if not key or not about:
+            if not fold(name) or not about:
                 raise ValueError("Each interest needs a name and a description.")
             if len(name) > 40 or len(about) > 1000:
                 raise ValueError(f"{name[:40]}: keep the name under 40 characters and the description under 1000.")
-            if key in taken:
+            if name in found:
                 raise ValueError(f"There's already a tab called {name}.")
-            taken.add(key)
             found[name] = about
         new["interests"] = found
+    # tag() matches the model's answers on letters and digits only, and no two tabs can have the same name. All is the
+    # app's first tab, None the writer's answer for no place, and Topics the feeds without one.
+    tabs = ["All", "None", "Topics"] + list(new.get("places", where)) + list(new.get("interests", before))
+    taken = set()
+    for tab in tabs if "places" in changes or "interests" in changes else []:
+        if fold(tab) in taken:
+            raise ValueError(f"There's already a tab called {tab}.")
+        taken.add(fold(tab))
+    if moves:
+        # Feeds and stories go along with a renamed place; a deleted place's have none. The feeds in sources.toml are
+        # grouped by their place's first name, the ones the app added by its current one.
+        renamed = {raw: moves.get(cur, cur) if cur is not None else None for raw, cur in setting(db, "renamed", {}).items()}
+        for old, name in moves.items():
+            renamed.setdefault(old, name)
+        new["renamed"] = {raw: name for raw, name in renamed.items() if raw != name}
+        edits = setting(db, "sources", None)
+        if edits:
+            edits["added"] = [s | {"region": moves.get(s["region"], s["region"])} for s in edits["added"]]
+            new["sources"] = edits
     if "sources" in changes:
-        bundled, rated = load_sources()[0], leans()
+        bundled, rated = load_sources(db, edited=False)[0], leans()
         feeds, urls, outlets, lean = [], set(), {}, {}
         for item in changes["sources"] if isinstance(changes["sources"], list) else [None]:
             name, url = field(item, "name"), field(item, "url")
@@ -1285,7 +1357,7 @@ def save_settings(db, changes):
             address = urlsplit(url)
             if address.scheme not in ("http", "https") or not address.hostname:
                 raise ValueError(f"{name}: the address needs to start with http:// or https://.")
-            if region not in REGIONS + [None] or lang not in ("nl", "en") or not isinstance(opinion, bool) \
+            if region not in list(where) + [None] or lang not in ("nl", "en") or not isinstance(opinion, bool) \
                     or rating not in (None, "left", "center", "right"):
                 raise ValueError(f"{name}: the app sent a region, language or lean the server doesn't know.")
             if url in urls:
@@ -1327,6 +1399,11 @@ def save_settings(db, changes):
         new["prompts"] = edited
     db.executemany("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
                    [(key, json.dumps(value, ensure_ascii=False)) for key, value in new.items()])
+    if moves:  # one statement per table, so swapping two names works
+        case, params = " ".join("WHEN ? THEN ?" for _ in moves), [x for move in moves.items() for x in move]
+        for table in ("articles", "stories"):
+            db.execute(f"UPDATE {table} SET region = CASE region {case} END WHERE region IN ({','.join('?' * len(moves))})",
+                       params + list(moves))
     changed = "interests" in new and new["interests"] != before
     if changed:
         db.execute("UPDATE stories SET interests = NULL WHERE updated >= ?", (iso(now() - SHOW),))

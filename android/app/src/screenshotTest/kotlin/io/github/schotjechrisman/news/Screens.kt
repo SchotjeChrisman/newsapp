@@ -172,6 +172,11 @@ fun FirstStartPreview() {
 
 private val settings = Settings(
     regions = listOf("Zwolle", "Overijssel", "NL", "EU", "US", "Global"),
+    places = listOf(
+        Place("Zwolle", "the city of Zwolle", 2, "Zwolle"),
+        Place("Overijssel", "the province of Overijssel outside Zwolle", 2, "Overijssel"),
+        Place("NL", "the Netherlands outside Overijssel, or the country as a whole", 5, "NL"),
+    ),
     interests = listOf(
         Interest("AI", "artificial intelligence: AI models and products, AI companies, chips for AI, AI rules, AI research"),
         Interest("S&P 500", "the US stock market itself: moves of the S&P 500 and other US indexes, results and share moves of large US-listed companies"),
@@ -215,10 +220,10 @@ fun SettingsOfflinePreview() {
 }
 
 @PreviewTest
-@Preview(name = "light", widthDp = 400, heightDp = 600)
+@Preview(name = "light", widthDp = 400, heightDp = 1000)
 @Composable
 fun InterestsPreview() {
-    NewsTheme { InterestsScreen(settings.interests, onBack = {}, save = { null }) }
+    NewsTheme { InterestsScreen(settings.places, settings.interests, onBack = {}, save = { null }) }
 }
 
 @PreviewTest

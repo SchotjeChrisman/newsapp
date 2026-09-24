@@ -342,7 +342,7 @@ fun App(state: NewsState) {
                     onPrompts = { screen = Screen.Prompts },
                     save = save,
                 )
-                Screen.Interests -> settings?.let { InterestsScreen(it.interests, onBack = back, save = save) }
+                Screen.Interests -> settings?.let { InterestsScreen(it.places, it.interests, onBack = back, save = save) }
                 Screen.Sources -> settings?.let { SourcesScreen(it, onBack = back, save = save) }
                 Screen.Prompts -> settings?.let {
                     PromptsScreen(it.prompts, onBack = back, onOpen = { kind -> promptKind = kind; screen = Screen.Prompt })

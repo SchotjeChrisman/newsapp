@@ -632,6 +632,59 @@ def test_settings():
         except ValueError:
             pass
 
+    db.execute("DELETE FROM settings WHERE key = 'interests'")
+    db.execute("INSERT INTO stories(id, updated, n, headline, region) VALUES (2, ?, 1, 'H', 'NL'), (3, ?, 1, 'H', 'Overijssel'),"
+               " (4, ?, 1, 'H', 'Zwolle')", (t,) * 3)
+    add_article(db, 30, 2, "NOS", "Kabinet valt", lang="nl")
+    db.execute("UPDATE articles SET region = 'NL' WHERE id = 30")
+    edited = news.settings_json(db)["places"]
+    assert edited[2] == {"name": "NL", "about": news.PLACES["NL"]["about"], "major": 5}
+    edited = [p | {"was": p["name"]} for p in edited if p["name"] != "Overijssel"]
+    edited[1] |= {"name": "Netherlands"}
+    edited.append({"name": "Deventer", "about": "the city of Deventer", "major": 2, "was": None})
+    assert news.save_settings(db, {"places": edited}) is False
+    assert news.api(db)["tabs"][:6] == ["Zwolle", "Netherlands", "EU", "US", "Global", "Deventer"]
+    regions = {s["url"]: s["region"] for s in news.load_sources(db)[0]}
+    bundled = {s["url"]: s["region"] for s in news.load_sources()[0]}
+    assert {regions[u] for u, r in bundled.items() if r == "NL" and u in regions} == {"Netherlands"}, "a renamed place keeps its feeds"
+    assert {regions[u] for u, r in bundled.items() if r == "Overijssel"} == {None}, "a deleted place's feeds have none"
+    assert regions["https://quanta.example/feed"] is None
+    assert db.execute("SELECT id, region FROM stories WHERE id > 1 ORDER BY id").fetchall() == [
+        (2, "Netherlands"), (3, None), (4, "Zwolle")]
+    assert db.execute("SELECT region FROM articles WHERE id = 30").fetchone() == ("Netherlands",)
+    assert "- Deventer: the city of Deventer" in news.system_prompt(db, "new")
+    assert news.reply_schema(db, "new")["properties"]["stories"]["items"]["properties"]["region"]["enum"] == [
+        "Zwolle", "Netherlands", "EU", "US", "Global", "Deventer", "None"]
+    feeds = news.settings_json(db)["sources"]
+    news.save_settings(db, {"sources": feeds})
+    assert news.setting(db, "sources", None)["removed"] == ["https://www.geenstijl.nl/feeds/recent.atom"], \
+        "a rename doesn't turn its feeds into edits"
+
+    swapped = [p | {"was": p["name"]} for p in news.settings_json(db)["places"]]
+    swapped[0]["name"], swapped[1]["name"] = "Netherlands", "Zwolle"
+    news.save_settings(db, {"places": swapped})
+    assert db.execute("SELECT id, region FROM stories WHERE id IN (2, 4) ORDER BY id").fetchall() == [
+        (2, "Zwolle"), (4, "Netherlands")], "two names swapped in one go"
+    assert {r for u, r in ((s["url"], s["region"]) for s in news.load_sources(db)[0]) if bundled.get(u) == "NL"} == {"Zwolle"}
+    swapped = [p | {"was": p["name"]} for p in news.settings_json(db)["places"]] + [{"name": "NL", "about": "x", "major": 3, "was": None}]
+    news.save_settings(db, {"places": swapped})
+    assert {s["region"] for s in news.load_sources(db)[0] if bundled.get(s["url"]) == "NL"} == {"Zwolle"}, \
+        "a new place with an old name doesn't take the feeds that moved"
+    current = [p | {"was": p["name"]} for p in news.settings_json(db)["places"]]
+    for bad in ({"places": current + [{"name": "Topics", "about": "x", "major": 1, "was": None}]},
+                {"places": current + [{"name": "ai", "about": "x", "major": 1, "was": None}]},
+                {"places": [current[0] | {"major": 0}]}, {"places": [current[0] | {"major": 2.5}]},
+                {"places": [current[0] | {"was": "Mars"}]}, {"places": [current[0], current[0] | {"name": "Z2"}]},
+                {"places": current, "sources": feeds}, {"interests": [{"name": "Deventer", "about": "x"}]},
+                {"places": current + [current[0] | {"was": None}]}, {"places": [current[1] | {"name": current[0]["name"]}, current[0]]},
+                {"places": [current[0] | {"was": ["x"]}]},
+                {"interests": [{"name": "Film", "about": "x"}, {"name": "Film", "about": "y"}]}):
+        try:
+            news.save_settings(db, bad)
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+
     news.save_settings(db, {"budgets": {"claude": 5, "mistral": 0}})
     assert news.budgets(db) == {"claude": 5.0, "mistral": 0.0}
     for bad in ({"claude": -1, "mistral": 0}, {"claude": float("nan"), "mistral": 0}, {"claude": "5", "mistral": 0}, {"claude": 5}):
@@ -643,10 +696,10 @@ def test_settings():
 
     news.save_settings(db, {"prompts": {"rules": "Rules: be brief.", "report": news.REPORT_PROMPT + "\n"}})
     new = news.system_prompt(db, "new")
-    assert new.startswith(news.NEW_PROMPT + "\nRules: be brief.\n") and new.endswith(news.FORMATS["new"])
+    assert new.startswith(news.NEW_PROMPT + "\nPlaces:\n- ") and new.endswith("\nRules: be brief.\n" + news.FORMATS["new"])
     assert news.setting(db, "prompts", None) == {"rules": "Rules: be brief."}, "a prompt set back to its default isn't stored"
     news.save_settings(db, {"prompts": {"rules": ""}})
-    assert news.system_prompt(db, "new") == "\n".join([news.NEW_PROMPT, news.RULES, news.FORMATS["new"]])
+    assert news.system_prompt(db, "new").endswith("\n".join(["", news.RULES, news.FORMATS["new"]]))
     for bad in ({"prompts": {"secret": "x"}}, {"prompts": "x"}, {"threshold": 0.5}, []):
         try:
             news.save_settings(db, bad)
