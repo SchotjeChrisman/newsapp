@@ -33,6 +33,8 @@ data class Story(
     val id: Long,
     val headline: String,
     val summary: String?,
+    /** Context the writer added from its own knowledge, not from the articles. */
+    val background: String? = null,
     val tabs: List<String>,
     /** How many outlets cover it now. With lift, a notable story's place in a subject's list, it orders the lists of the
      *  tabs; the All list is in the server's order. */
@@ -148,6 +150,7 @@ private fun story(s: JSONObject): Story {
         id = s.getLong("id"),
         headline = s.getString("headline"),
         summary = s.text("summary"),
+        background = s.text("background"),
         tabs = s.getJSONArray("tabs").strings(),
         coverage = s.optDouble("coverage", 0.0),
         lift = s.optJSONObject("lift")?.let { lift -> lift.keys().asSequence().associateWith { lift.getDouble(it) } }.orEmpty(),

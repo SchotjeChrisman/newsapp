@@ -211,6 +211,21 @@ def test_translate_before_grouping():
     assert sorted(embedded) == ["Cabinet falls. The cabinet has fallen.", "Dutch cabinet falls. The Dutch cabinet has fallen."]
     del os.environ["MISTRAL_API_KEY"]
 
+    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "test"
+    add_article(db, 3, None, "NOS", "Storm raast over kust", lang="nl")
+    original = news.call_claude
+
+    def claude(model, system, payload, schema):
+        assert model == news.CLAUDE_WRITER and schema == news.SCHEMAS["translate"] and [i["id"] for i in payload["items"]] == [3]
+        return json.dumps({"items": [{"id": 3, "title": "Storm rages over coast", "text": ""}]}), 0.01
+
+    news.call_claude = claude
+    news.group(db)
+    assert db.execute("SELECT title_en FROM articles WHERE id = 3").fetchone() == ("Storm rages over coast",), \
+        "Claude translates without a Mistral key"
+    news.call_claude = original
+    del os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+
 
 def test_language_backfill():
     with tempfile.TemporaryDirectory() as tmp:
@@ -256,6 +271,7 @@ def test_write():
         calls.append((system, payload))
         if system.startswith(news.NEW_PROMPT):
             reply = {"stories": [{"key": "s1", "headline": "Dutch cabinet falls", "summary": "The cabinet fell.", "region": "NL",
+                                  "background": " The cabinet is the Dutch government. ",
                                   "quotes": [{"article": "a3", "quote": "“Het kabinet had geen plan meer”",
                                               "quote_en": "The cabinet had no plan left"},
                                              {"article": "a3", "quote": "Dit citaat staat nergens in het stuk", "quote_en": "Made up"},
@@ -292,6 +308,7 @@ def test_write():
 
     page = news.render(db)
     assert "The king accepted the resignation." in page and "The cabinet had no plan left" in page
+    assert "The cabinet is the Dutch government." in page
     assert page.count(">Tubantia</a>") == 1, "the summary names the sources it was written from"
     assert "Een column zonder nieuws" not in page
 
@@ -299,6 +316,7 @@ def test_write():
     assert [s["id"] for s in data["stories"]] == [1], "the app gets the stories the page shows"
     [story] = data["stories"]
     assert (story["headline"], story["summary"], story["tabs"], story["sources"]) == ("Dutch cabinet falls", "The cabinet fell.", ["NL"], 3)
+    assert story["background"] == "The cabinet is the Dutch government."
     assert story["lean"] == {"left": 1, "center": 1, "right": 0}, "Trouw and NOS; the Tubantia copy counts once"
     assert story["updates"] == [{"at": story["updates"][0]["at"], "text": "The king accepted the resignation.",
                                  "from": [{"outlet": "NOS", "url": "https://x.nl/5"}]}]
