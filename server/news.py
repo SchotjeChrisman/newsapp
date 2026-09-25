@@ -27,9 +27,10 @@ from contextlib import closing
 from datetime import datetime, time as clock, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 import numpy as np
+import trafilatura
 
 DB = os.environ.get("NEWS_DB", "/data/news.db")
 SOURCES = Path(__file__).with_name("sources.toml")
@@ -64,6 +65,12 @@ ELSEWHERE = "Elsewhere"
 ELSEWHERE_SOURCES = 30
 ELSEWHERE_SUBJECT_SOURCES = 5
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+CONSENT_WALL = "myprivacy.dpgmedia.nl"  # DPG Media's cookie wall before AD, NU.nl, Volkskrant, Tweakers and more
+PAYWALLED = re.compile(rb"isAccessibleForFree\W{1,20}false", re.I)  # how publishers mark paid articles for Google
+PAGE_MAX = 12000
+PAGES_PER_STORY = 3
+PAGES_WITHIN = 600  # seconds for all article pages of a run together
+EXTRACTING = threading.Lock()  # trafilatura isn't thread-safe: extracting in parallel threads crashed the process
 OPINION = re.compile(r"/(columns?-opinie|opinie|opinions?|columns?|commentisfree|commentary)/", re.I)
 # Google News links hide the section, so its opinion pieces are recognized by the label in the headline.
 OPINION_TITLE = re.compile(r"^(opinion|opinie|column)\s*[|:]|\|\s*(opinion|opinie|column)\s*$", re.I)
@@ -282,6 +289,51 @@ def fetch(source):
         return parse_feed(data), None
     except Exception as e:
         return [], f"{type(e).__name__}: {e}"
+
+
+def google_news_target(url):
+    """Where a Google News link leads. The link only holds an id; this is the request Google's own page makes for it."""
+    gid = urlsplit(url).path.rsplit("/", 1)[-1]
+    with urllib.request.urlopen(urllib.request.Request(f"https://news.google.com/articles/{gid}",
+                                                       headers={"User-Agent": UA}), timeout=20) as r:
+        page = r.read(2_000_000).decode("utf-8", "replace")
+    sign, stamp = re.search(r'data-n-a-sg="([^"]+)"', page), re.search(r'data-n-a-ts="([^"]+)"', page)
+    if not sign or not stamp:
+        raise ValueError("no signature on the Google News page")
+    client = [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None, None, 0, 1],
+              "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0]
+    request = ["garturlreq", client, gid, int(stamp.group(1)), sign.group(1)]
+    body = urlencode({"f.req": json.dumps([[["Fbv4je", json.dumps(request), None, "generic"]]])}).encode()
+    headers = {"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"}
+    with urllib.request.urlopen(urllib.request.Request("https://news.google.com/_/DotsSplashUi/data/batchexecute", body,
+                                                       headers), timeout=20) as r:
+        reply = r.read(1_000_000).decode()
+    return json.loads(json.loads(reply.split("\n\n", 1)[1])[0][2])[1]
+
+
+def fetch_page(url):
+    """The text of an article's page, "" when the publisher marks it as paid."""
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+    if urlsplit(url).netloc == "news.google.com":
+        url = google_news_target(url)
+
+    def get(u):
+        with opener.open(urllib.request.Request(u, headers={"User-Agent": UA}), timeout=20) as r:
+            data = r.read(5_000_000)
+            url = r.url
+        if data[:2] == b"\x1f\x8b":
+            data = zlib.decompressobj(wbits=31).decompress(data, 20_000_000)
+        return url, data
+
+    url, data = get(url)
+    # The wall's page sends the browser on to this link once its consent script has run, and when that script fails.
+    if urlsplit(url).netloc == CONSENT_WALL and (link := re.search(rb"decodeURIComponent\('([^']+)'\)", data)):
+        url, data = get(unquote(link.group(1).decode()))
+    if PAYWALLED.search(data):
+        return ""
+    with EXTRACTING:
+        text = trafilatura.extract(data, url=url, include_comments=False)
+    return (text or "")[:PAGE_MAX]
 
 
 def collect(db):
@@ -540,9 +592,11 @@ RULES = """Rules:
 - Say only what the articles say. Never add background, significance, reactions, numbers or unknowns they don't state
   (no "has drawn attention", "remains unclear", "has not been disclosed").
   A new story's background is the one exception.
-- Article texts are often teasers cut off mid-sentence, and some articles are only a headline. Never fill in what isn't
-  there: a date, a number or a name the article doesn't give is left out. Use each article's publication time to place
-  words like "Saturday" or "today", but it is when the article appeared, not when the event happened.
+- An article's text is either its page's text or only the teaser from its feed, often cut off mid-sentence, and some
+  articles are only a headline. Page text is extracted automatically: skip site text in it like share buttons,
+  subscription offers and links to other articles. Never fill in what isn't there: a date, a number or a name the
+  article doesn't give is left out. Use each article's publication time to place words like "Saturday" or "today",
+  but it is when the article appeared, not when the event happened.
 - Dutch articles may come with english_title, a machine translation to help you; the Dutch is what counts.
   Put Dutch words into English ("Zwolse steeg": an alley in Zwolle), but keep names of people, places and organisations.
 - An article can be a roundup of several topics; write only about the topic the story is about.
@@ -558,6 +612,13 @@ RULES = """Rules:
 - Quotes: only from articles marked opinion, at most 3 per story, each one sentence or less, copied exactly
   (same words, same language) from that article's title or text, with an English translation (quote_en).
 - Refer to stories and articles by their key exactly as given ("s1", "a4")."""
+
+READ_PROMPT = """You pick what the writer of a private news app reads in full. Each story is a group of articles about
+one event, possibly in Dutch, each with its headline and the teaser from its feed; some have only a headline. For each
+story, list the articles whose full page the writer should read to tell the story well: the ones that look most
+informative and together cover the most, from different outlets where possible. A story with one article needs that
+one, unless its teaser already says all there is, like a match result. Pick at most 3 per story. Refer to stories and
+articles by their key exactly as given ("s1", "a4")."""
 
 NEW_PROMPT = """You write the stories for a private news app. Each input story is a group of articles about one event,
 possibly in Dutch. For every story write:
@@ -597,11 +658,13 @@ repeat it. Refer to stories by their key exactly as given ("s1")."""
 
 # The prompts by kind, with their name and what the app says about them. The app can replace each text; the code adds
 # the writing rules, the interests and the reply format, which it depends on and so can't be changed.
-PROMPTS = {"translate": TRANSLATE_PROMPT, "rules": RULES, "new": NEW_PROMPT, "update": UPDATE_PROMPT, "tag": TAG_PROMPT,
-           "report": REPORT_PROMPT}
+PROMPTS = {"translate": TRANSLATE_PROMPT, "rules": RULES, "read": READ_PROMPT, "new": NEW_PROMPT,
+           "update": UPDATE_PROMPT, "tag": TAG_PROMPT, "report": REPORT_PROMPT}
 PROMPT_NOTES = {
     "translate": ("Translation", "Turns Dutch headlines and teasers into English. The reply format is added after it."),
     "rules": ("Writing rules", "Added to the prompts for new stories and for updates."),
+    "read": ("Reading", "Picks from headlines and teasers the articles whose full page is read before a story is "
+                        "written. The reply format is added after it."),
     "new": ("New stories", "Writes a new story's headline, summary and background. The places, the writing rules and "
                            "the reply format are added after it."),
     "update": ("Updates", "Adds a sentence to a story for each new article. The writing rules and the reply format are added "
@@ -611,6 +674,7 @@ PROMPT_NOTES = {
 }
 FORMATS = {
     "translate": 'Return JSON: {"items": [{"id": <id>, "title": "<English title>", "text": "<English text>"}]}',
+    "read": 'Return JSON: {"stories": [{"key": "s1", "articles": ["a1", "a3"]}]}',
     "new": """Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "background": "", "region": "...",
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}""",
     "update": """Return JSON: {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "..."}],
@@ -626,6 +690,9 @@ SCHEMAS = {
     "translate": {"type": "object", "required": ["items"], "properties": {"items": {"type": "array", "items": {
         "type": "object", "required": ["id", "title", "text"],
         "properties": {"id": {"type": "integer"}, "title": {"type": "string"}, "text": {"type": "string"}}}}}},
+    "read": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
+        "type": "object", "required": ["key", "articles"],
+        "properties": {"key": {"type": "string"}, "articles": {"type": "array", "items": {"type": "string"}}}}}}},
     "new": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
         "type": "object", "required": ["key", "headline", "summary", "background", "region"],
         "properties": {"key": {"type": "string"}, "headline": {"type": "string"}, "summary": {"type": "string"},
@@ -704,7 +771,7 @@ def mistral_articles(rows):
     """Articles as Mistral gets them. A word-for-word copy in a sister paper (same headline, same or no teaser) goes in
     once, with the longest teaser and its outlet under also_in; ids holds every copy."""
     kept, seen = [], []
-    for story, aid, outlet, published, opinion, title, summary, written, title_en, *_ in rows:
+    for story, aid, outlet, published, opinion, title, summary, written, title_en, url, *_ in rows:
         title_key, text_key = normalized(title), normalized(summary[:200])
         match = next((a for a, (t, x) in zip(kept, seen) if t == title_key and (not x or not text_key or x == text_key)), None)
         if match:
@@ -712,14 +779,73 @@ def mistral_articles(rows):
             if outlet != match["outlet"] and outlet not in match.setdefault("also_in", []):
                 match["also_in"].append(outlet)
             if len(summary) > len(match["text"]):
-                match["text"] = summary
+                match["text"], match["url"] = summary, url
                 seen[kept.index(match)] = (title_key, text_key)
             continue
-        kept.append(dict(id=aid, ids=[aid], outlet=outlet, opinion=bool(opinion), title=title, text=summary,
+        kept.append(dict(id=aid, ids=[aid], outlet=outlet, opinion=bool(opinion), title=title, text=summary, url=url,
                          published=datetime.fromisoformat(published).astimezone().strftime("%a %d %b %Y %H:%M"))
                     | ({"english_title": title_en} if title_en else {}))
         seen.append((title_key, text_key))
     return kept
+
+
+def read_pages(db, model, stories):
+    """The model picks from their headlines and teasers the articles it wants to read in full, and their pages replace
+    those teasers, so a story is written from its articles and not only from its feeds. A page that's paid, blocked,
+    slow or holds no more than the teaser leaves the teaser; so does a failed or unaffordable request."""
+    wanted = []
+    for batch in batches(stories, 40, 200):
+        keyed, payload, n = {}, [], 0
+        for i, st in enumerate(batch, 1):
+            items = []
+            for a in st["articles"]:
+                n += 1
+                keyed[f"a{n}"] = a
+                items.append({"key": f"a{n}", "outlet": a["outlet"], "title": a["title"], "text": a["text"][:300]})
+            payload.append({"key": f"s{i}", "articles": items})
+        try:
+            result = ask(db, model, "read", {"stories": payload}, 2000)
+        except (ClaudeUnavailable, OverBudget) as e:
+            print(f"read: {e}", flush=True)
+            break
+        except (ValueError, TypeError, KeyError, OSError, http.client.HTTPException) as e:
+            print(f"read: batch skipped ({type(e).__name__}: {e})", flush=True)
+            continue
+        items = result.get("stories") if isinstance(result, dict) else None
+        for item in items if isinstance(items, list) else []:
+            keys = item.get("articles") if isinstance(item, dict) else None
+            keys = [k for k in keys if isinstance(k, str) and k in keyed] if isinstance(keys, list) else []
+            wanted += [keyed[k] for k in dict.fromkeys(keys)][:PAGES_PER_STORY]
+    picked, read, blocked = len(wanted), [], set()
+    deadline = time.monotonic() + PAGES_WITHIN
+
+    def work():
+        while time.monotonic() < deadline:
+            try:
+                a = wanted.pop(0)  # in the order the stories are written, most sources first
+            except IndexError:
+                return
+            if urlsplit(a["url"]).netloc in blocked:
+                continue
+            try:
+                text = fetch_page(a["url"])
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 402, 403, 429):  # a bot wall, a paywall or a rate limit: skip the site this run
+                    blocked.add(urlsplit(e.url).netloc)
+                continue
+            except Exception:  # a timeout or the network
+                continue
+            if len(text) > max(len(a["text"]), 500):
+                a["text"] = text
+                read.append(a)
+
+    # ponytail: a stuck daemon thread lingers until its server gives up, like in collect; what it reads late is unused
+    threads = [threading.Thread(target=work, daemon=True) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(max(0, deadline - time.monotonic()))
+    print(f"read: {len(read)} of {picked} picked pages", flush=True)
 
 
 def available_writers():
@@ -733,7 +859,7 @@ def write(db):
     if not writers:
         return
     rows = db.execute("""SELECT a.story, a.id, a.outlet, a.published, a.opinion, a.title, a.summary, a.written,
-                                a.title_en, s.headline, s.summary
+                                a.title_en, a.url, s.headline, s.summary
                          FROM articles a JOIN stories s ON s.id = a.story
                          WHERE s.updated >= ? ORDER BY a.published""", (iso(now() - SHOW),)).fetchall()
     by_story = defaultdict(list)
@@ -744,7 +870,7 @@ def write(db):
         sources = source_count([(r[2], r[5]) for r in rs])
         if sources < 2 and all(r[4] for r in rs):
             continue
-        headline, summary = rs[0][9], rs[0][10]
+        headline, summary = rs[0][10], rs[0][11]
         fresh = ([r for r in rs if not r[7]] if headline else rs)[:30]
         if not fresh:
             continue
@@ -761,6 +887,7 @@ def write(db):
     work = ([("new", b) for b in batches([st for st in new if st["sources"] > 1], 6, 30)]
             + [("update", b) for b in batches(updates, 1, 30)]
             + [("new", b) for b in batches([st for st in new if st["sources"] == 1], 10, 30)])
+    read_pages(db, writers[0], [st for _, batch in work for st in batch])
     written = updated = failures = 0
     try:
         for kind, batch in work:
@@ -773,7 +900,7 @@ def write(db):
                     articles[f"a{n}"] = a
                 keyed[f"s{i}"] = (st, articles)
                 stories.append({"key": f"s{i}", "source_count": st["sources"],
-                                "articles": [{"key": k} | {f: v for f, v in a.items() if f not in ("id", "ids")}
+                                "articles": [{"key": k} | {f: v for f, v in a.items() if f not in ("id", "ids", "url")}
                                              for k, a in articles.items()]}
                                | ({"current": st["current"]} if "current" in st else {}))
             try:
