@@ -256,6 +256,7 @@ def test_write():
         calls.append((system, payload))
         if system.startswith(news.NEW_PROMPT):
             reply = {"stories": [{"key": "s1", "headline": "Dutch cabinet falls", "summary": "The cabinet fell.", "region": "NL",
+                                  "background": " The cabinet is the Dutch government. ",
                                   "quotes": [{"article": "a3", "quote": "“Het kabinet had geen plan meer”",
                                               "quote_en": "The cabinet had no plan left"},
                                              {"article": "a3", "quote": "Dit citaat staat nergens in het stuk", "quote_en": "Made up"},
@@ -292,6 +293,7 @@ def test_write():
 
     page = news.render(db)
     assert "The king accepted the resignation." in page and "The cabinet had no plan left" in page
+    assert "The cabinet is the Dutch government." in page
     assert page.count(">Tubantia</a>") == 1, "the summary names the sources it was written from"
     assert "Een column zonder nieuws" not in page
 
@@ -299,6 +301,7 @@ def test_write():
     assert [s["id"] for s in data["stories"]] == [1], "the app gets the stories the page shows"
     [story] = data["stories"]
     assert (story["headline"], story["summary"], story["tabs"], story["sources"]) == ("Dutch cabinet falls", "The cabinet fell.", ["NL"], 3)
+    assert story["background"] == "The cabinet is the Dutch government."
     assert story["lean"] == {"left": 1, "center": 1, "right": 0}, "Trouw and NOS; the Tubantia copy counts once"
     assert story["updates"] == [{"at": story["updates"][0]["at"], "text": "The king accepted the resignation.",
                                  "from": [{"outlet": "NOS", "url": "https://x.nl/5"}]}]

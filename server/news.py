@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 # Columns added after the first release; connect() adds them to older databases.
 COLUMNS = {"articles": ["lang TEXT", "title_en TEXT", "summary_en TEXT", "written INTEGER DEFAULT 0"],
            "stories": ["headline TEXT", "summary TEXT", "region TEXT", "summary_articles TEXT", "interests TEXT",
-                       "notable INTEGER"],
+                       "notable INTEGER", "background TEXT"],
            "spend": ["claude_usd REAL DEFAULT 0"]}
 
 
@@ -536,6 +536,7 @@ RULES = """Rules:
 - Write English only, in plain neutral language: no loaded or emotive words, no speculation.
 - Say only what the articles say. Never add background, significance, reactions, numbers or unknowns they don't state
   (no "has drawn attention", "remains unclear", "has not been disclosed").
+  A new story's background is the one exception.
 - Article texts are often teasers cut off mid-sentence, and some articles are only a headline. Never fill in what isn't
   there: a date, a number or a name the article doesn't give is left out. Use each article's publication time to place
   words like "Saturday" or "today", but it is when the article appeared, not when the event happened.
@@ -558,8 +559,16 @@ RULES = """Rules:
 NEW_PROMPT = """You write the stories for a private news app. Each input story is a group of articles about one event,
 possibly in Dutch. For every story write:
 - headline: neutral and factual, at most 14 words.
-- summary: what happened, as far as the articles tell it. One sentence when they give little more than a headline;
-  never more than 4 sentences or 90 words. Short beats padded.
+- summary: the story itself, written as a news article: what happened first, then the details, causes, plans and
+  reactions the articles give. As long as the articles make it and no longer: one sentence when they give little more
+  than a headline, a few paragraphs separated by a blank line when they give that much. Never pad it: no repetition,
+  no filler, no restating the headline.
+- background: what a reader needs to know to understand the story that the articles don't say, like what an unfamiliar
+  organisation, technology, law or earlier event is, in plain words a non-specialist understands. At most 3 sentences or
+  60 words, shown apart from the summary, which still says only what the articles say. Only settled facts you are sure
+  of that can't have changed since you learned them: nothing about this event itself, nobody's current office, status or
+  whereabouts, no figures or rankings, no significance, predictions or opinions. Empty when the summary is clear
+  without it or when you're unsure.
 - region: the most specific place the story is about, from the places below. Elsewhere when it is about a place none
   of them covers; the reader doesn't follow it. None when it is about no place (a product launch, a study, an album)."""
 
@@ -590,8 +599,8 @@ PROMPTS = {"translate": TRANSLATE_PROMPT, "rules": RULES, "new": NEW_PROMPT, "up
 PROMPT_NOTES = {
     "translate": ("Translation", "Mistral turns Dutch headlines and teasers into English. The reply format is added after it."),
     "rules": ("Writing rules", "Added to the prompts for new stories and for updates."),
-    "new": ("New stories", "Writes a new story's headline and summary. The places, the writing rules and the reply format are "
-                           "added after it."),
+    "new": ("New stories", "Writes a new story's headline, summary and background. The places, the writing rules and "
+                           "the reply format are added after it."),
     "update": ("Updates", "Adds a sentence to a story for each new article. The writing rules and the reply format are added "
                           "after it."),
     "tag": ("Interests", "Sorts stories into your interests. The interests and the reply format are added after it."),
@@ -599,7 +608,7 @@ PROMPT_NOTES = {
 }
 FORMATS = {
     "translate": 'Return JSON: {"items": [{"id": <id>, "title": "<English title>", "text": "<English text>"}]}',
-    "new": """Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "region": "...",
+    "new": """Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "background": "", "region": "...",
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}""",
     "update": """Return JSON: {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "..."}],
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}""",
@@ -612,8 +621,9 @@ QUOTES_SCHEMA = {"type": "array", "items": {"type": "object", "required": ["arti
                                                             "quote_en": {"type": "string"}}}}
 SCHEMAS = {
     "new": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
-        "type": "object", "required": ["key", "headline", "summary", "region"],
+        "type": "object", "required": ["key", "headline", "summary", "background", "region"],
         "properties": {"key": {"type": "string"}, "headline": {"type": "string"}, "summary": {"type": "string"},
+                       "background": {"type": "string"},
                        "region": {"enum": REGIONS + [ELSEWHERE, "None"]}, "quotes": QUOTES_SCHEMA}}}}},
     "update": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
         "type": "object", "required": ["key", "facts"],
@@ -696,10 +706,10 @@ def mistral_articles(rows):
             if outlet != match["outlet"] and outlet not in match.setdefault("also_in", []):
                 match["also_in"].append(outlet)
             if len(summary) > len(match["text"]):
-                match["text"] = summary[:500]
+                match["text"] = summary
                 seen[kept.index(match)] = (title_key, text_key)
             continue
-        kept.append(dict(id=aid, ids=[aid], outlet=outlet, opinion=bool(opinion), title=title, text=summary[:500],
+        kept.append(dict(id=aid, ids=[aid], outlet=outlet, opinion=bool(opinion), title=title, text=summary,
                          published=datetime.fromisoformat(published).astimezone().strftime("%a %d %b %Y %H:%M"))
                     | ({"english_title": title_en} if title_en else {}))
         seen.append((title_key, text_key))
@@ -763,7 +773,7 @@ def write(db):
             try:
                 while True:
                     try:
-                        result = ask(db, writers[0], kind, {"stories": stories}, 4000)
+                        result = ask(db, writers[0], kind, {"stories": stories}, 8000)
                         failures = 0
                         break
                     except ClaudeFailed as e:
@@ -788,10 +798,12 @@ def write(db):
                         headline, summary = str(item.get("headline") or "").strip(), str(item.get("summary") or "").strip()
                         if not headline or not summary:
                             continue
-                        region = item.get("region")
+                        region, background = item.get("region"), item.get("background")
                         region = region if isinstance(region, str) and region in [*known, ELSEWHERE] else None
-                        db.execute("UPDATE stories SET headline = ?, summary = ?, region = ?, summary_articles = ? WHERE id = ?",
-                                   (headline, summary, region, json.dumps(st["ids"]), st["id"]))
+                        background = background.strip() or None if isinstance(background, str) else None
+                        db.execute("UPDATE stories SET headline = ?, summary = ?, background = ?, region = ?,"
+                                   " summary_articles = ? WHERE id = ?",
+                                   (headline, summary, background, region, json.dumps(st["ids"]), st["id"]))
                         written += 1
                     else:
                         # One sentence per new article, each linked to that article (and its word-for-word copies).
@@ -1090,6 +1102,8 @@ def story_html(s):
         body += f'<p class="summary">{esc(s["summary"])}</p>'
         if line := sources_line(s["summary_articles"], by_id):
             body += f'<p class="from">{line}</p>'
+    if s["background"]:
+        body += f'<p class="background"><b>Background</b> {esc(s["background"])}</p>'
     if s["updates"]:
         body += '<ul class="updates">' + "".join(
             f'<li><time>{when(at)}</time> {esc(text)} <span class="from">{sources_line(ids, by_id)}</span></li>'
@@ -1118,7 +1132,8 @@ def shown(db, ids=None):
     for r in rows:
         by_story[r[0]].append(r)
     written = {r[0]: r[1:] for r in db.execute(
-        "SELECT s.id, s.headline, s.summary, s.region, s.summary_articles, s.interests, s.notable FROM stories s"
+        "SELECT s.id, s.headline, s.summary, s.region, s.summary_articles, s.interests, s.notable, s.background"
+        " FROM stories s"
         f" WHERE {where} AND s.headline IS NOT NULL", params)}
     updates, quotes = defaultdict(list), defaultdict(list)
     for r in db.execute(f"""SELECT u.story, u.at, u.text, u.articles FROM updates u JOIN stories s ON s.id = u.story
@@ -1133,12 +1148,12 @@ def shown(db, ids=None):
         sources = source_count([(a[1], a[7]) for a in arts])
         if sources < 2 and all(a[6] for a in arts):
             continue  # a lone opinion column waits until the topic gets more coverage
-        headline, summary, region, summary_articles, interests, notable = written.get(sid, (None,) * 6)
+        headline, summary, region, summary_articles, interests, notable, background = written.get(sid, (None,) * 7)
         # Once written, the region is Mistral's reading of what the story is about; before that, the outlets' regions.
         regions = ([region] if region else []) if headline else sorted({a[2] for a in arts if a[2]})
         stories.append(dict(id=sid, arts=arts, sources=sources, headline=headline, summary=summary, regions=regions,
                             summary_articles=summary_articles, interests=json.loads(interests or "[]"), notable=bool(notable),
-                            updates=updates[sid], quotes=quotes[sid]))
+                            background=background, updates=updates[sid], quotes=quotes[sid]))
     stories.sort(key=lambda s: (s["sources"], s["arts"][-1][5]), reverse=True)
     return stories
 
@@ -1199,7 +1214,8 @@ button:focus-visible, a:focus-visible, summary:focus-visible {{ outline: 2px sol
 .count span {{ font-size: 0.65rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }}
 .story h2 {{ font: 600 1.15rem/1.3 var(--serif); margin: 0 0 8px; text-wrap: balance; overflow-wrap: anywhere; }}
 .story ul {{ list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 0.88rem; }}
-.summary {{ margin: 0 0 10px; max-width: 65ch; }}
+.summary {{ margin: 0 0 10px; max-width: 65ch; white-space: pre-line; }}
+.background {{ margin: 0 0 10px; max-width: 65ch; color: var(--muted); font-size: 0.92rem; }}
 .story ul.updates {{ margin-bottom: 10px; padding-left: 10px; border-left: 2px solid var(--accent); font-size: 0.92rem; }}
 .story ul.quotes {{ margin-bottom: 10px; font-size: 0.92rem; }}
 q {{ font-family: var(--serif); font-style: italic; }}
@@ -1283,7 +1299,7 @@ def story_json(s, lean):
         return [{"outlet": outlet, "url": url} for outlet, url in cited(ids, by_id).items()]
 
     return {
-        "id": s["id"], "headline": s["headline"] or arts[0][3], "summary": s["summary"],
+        "id": s["id"], "headline": s["headline"] or arts[0][3], "summary": s["summary"], "background": s["background"],
         "tabs": s["regions"] + s["interests"], "coverage": round(s.get("coverage", 0), 3),
         "lift": {subject: round(lift, 3) for subject, lift in s.get("lift", {}).items()},
         "sources": s["sources"], "updated": arts[-1][5], "lean": lean_counts([(a[1], a[7]) for a in arts], lean), "summary_from": refs(s["summary_articles"]),
