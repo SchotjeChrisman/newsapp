@@ -4,6 +4,7 @@ import os
 
 os.environ["NEWS_DB"] = ":memory:"
 
+import base64
 import gzip
 import io
 import json
@@ -12,6 +13,7 @@ import threading
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -247,12 +249,51 @@ def test_language_backfill():
 
 def test_mistral_articles():
     now = news.iso(news.now())
-    rows = [(1, 1, "1Zwolle", now, 0, "Brand bij rechtbank", "", 0, None), (1, 2, "Weblog Zwolle", now, 0, "Brand bij rechtbank", "Kort ontruimd.", 0, None),
-            (1, 3, "SCMP", now, 0, "Actress dies", "Died of an overdose.", 0, None), (1, 4, "PBS", now, 0, "Actress dies", "Found at home.", 0, None)]
+    rows = [(1, 1, "1Zwolle", now, 0, "Brand bij rechtbank", "", 0, None, "https://1zwolle.nl/1"),
+            (1, 2, "Weblog Zwolle", now, 0, "Brand bij rechtbank", "Kort ontruimd.", 0, None, "https://weblogzwolle.nl/2"),
+            (1, 3, "SCMP", now, 0, "Actress dies", "Died of an overdose.", 0, None, "https://scmp.com/3"),
+            (1, 4, "PBS", now, 0, "Actress dies", "Found at home.", 0, None, "https://pbs.org/4")]
     merged, scmp, pbs = news.mistral_articles(rows)
     assert (merged["ids"], merged["text"], merged["also_in"]) == ([1, 2], "Kort ontruimd.", ["Weblog Zwolle"]), \
         "a copy without a teaser merges into one with a teaser, keeping the longest"
+    assert merged["url"] == "https://weblogzwolle.nl/2", "the link of the copy whose teaser is kept"
     assert (scmp["ids"], pbs["ids"]) == ([3], [4]), "the same headline over different teasers isn't a copy"
+
+
+def test_fetch_page():
+    para = "De gemeente Zwolle bouwt een nieuwe brug over de IJssel, de ‘Zwolse brug’, die in 2028 klaar moet zijn. " * 3
+    page = ('<html><head><meta charset="utf-8"><title>Brug</title></head><body><nav>Home | Nieuws | Sport</nav>'
+            f"<article><h1>Nieuwe brug</h1><p>{para}</p><p>{para}</p><p>{para}</p></article>"
+            '<div id="comments" class="comments"><h3>Reacties</h3><p>Jan: Die brug komt er nooit, wedden?</p></div>'
+            "<footer>© 2026 De Krant</footer></body></html>")
+    as_data = lambda html: "data:text/html," + urllib.parse.quote(html)
+    text = news.fetch_page(as_data(page))
+    assert "de ‘Zwolse brug’" in text and "Sport" not in text and "De Krant" not in text, text
+    assert "wedden" not in text, "reader comments aren't the article"
+    paid = page.replace("<title>", '<script type="application/ld+json">{"isAccessibleForFree": false}</script><title>')
+    assert news.fetch_page(as_data(paid)) == "", "a page the publisher marks as paid"
+    zipped = "data:application/octet-stream;base64," + base64.b64encode(gzip.compress(page.encode())).decode()
+    assert "de ‘Zwolse brug’" in news.fetch_page(zipped), "a page sent gzipped unasked"
+    zipped = "data:application/octet-stream;base64," + base64.b64encode(gzip.compress(paid.encode())).decode()
+    assert news.fetch_page(zipped) == "", "a paid page sent gzipped"
+    wall, news.CONSENT_WALL = news.CONSENT_WALL, ""  # data: links have no host, like the wall is for this test
+    consent = f"<script>const callbackUrl = new URL(decodeURIComponent('{urllib.parse.quote(as_data(page), safe='')}'))</script>"
+    assert "de ‘Zwolse brug’" in news.fetch_page(as_data(consent)), "past the cookie wall by its own link"
+    news.CONSENT_WALL = wall
+    most, news.PAGE_MAX = news.PAGE_MAX, 50
+    assert len(news.fetch_page(as_data(page))) == 50
+    news.PAGE_MAX = most
+
+    urlopen = news.urllib.request.urlopen
+    google = {"https://news.google.com/articles/CBMiabc": b'<c-wiz><div data-n-a-sg="SIG" data-n-a-ts="1790000000"></div>',
+              "https://news.google.com/_/DotsSplashUi/data/batchexecute":
+                  b')]}\'\n\n[["wrb.fr","Fbv4je","[\\"garturlres\\",\\"https://www.oost.nl/nieuws/1\\",1]",null,null,null,"generic"]]'}
+    news.urllib.request.urlopen = lambda request, **_: io.BytesIO(google[request.full_url])
+    assert news.google_news_target("https://news.google.com/rss/articles/CBMiabc?oc=5") == "https://www.oost.nl/nieuws/1"
+    news.urllib.request.urlopen = urlopen
+    target, news.google_news_target = news.google_news_target, lambda url: as_data(page)
+    assert "de ‘Zwolse brug’" in news.fetch_page("https://news.google.com/rss/articles/CBMiabc"), "read where Google leads"
+    news.google_news_target = target
 
 
 def test_write():
@@ -265,11 +306,15 @@ def test_write():
                 summary="Het kabinet had geen plan meer voor de asielcrisis.")
     add_article(db, 4, 2, "Trouw", "Een column zonder nieuws", opinion=1, lang="nl")
     add_article(db, 8, 1, "Tubantia", "Kabinet valt", lang="nl")  # a sister paper's word-for-word copy
-    calls = []
+    calls, asked = [], []
+    pages = {"https://x.nl/2": "The Dutch cabinet fell on Friday after the coalition split over asylum policy. " * 8,
+             "https://x.nl/3": "Het kabinet had geen plan meer voor de asielcrisis. Meer staat er niet."}
 
     def fake(model, system, payload, max_tokens):
         calls.append((system, payload))
-        if system.startswith(news.NEW_PROMPT):
+        if system.startswith(news.READ_PROMPT):
+            reply = {"stories": [{"key": "s1", "articles": [["a1"], "a2", "a9", "a2"]}, {"key": "s1", "articles": ["a3", "a1"]}]}
+        elif system.startswith(news.NEW_PROMPT):
             reply = {"stories": [{"key": "s1", "headline": "Dutch cabinet falls", "summary": "The cabinet fell.", "region": "NL",
                                   "background": " The cabinet is the Dutch government. ",
                                   "quotes": [{"article": "a3", "quote": "“Het kabinet had geen plan meer”",
@@ -283,18 +328,28 @@ def test_write():
         return json.dumps(reply), (1000, 500)
 
     news.call_mistral = fake
+    fetch_page, pages_per_story = news.fetch_page, news.PAGES_PER_STORY
+    news.fetch_page, news.PAGES_PER_STORY = lambda url: asked.append(url) or pages[url], 2
     news.write(db)
-    [(_, first)] = calls
+    news.fetch_page, news.PAGES_PER_STORY = fetch_page, pages_per_story
+    [(read_prompt, read), (_, first)] = calls
+    assert read_prompt.startswith(news.READ_PROMPT) and "url" not in read["stories"][0]["articles"][0]
+    assert read["stories"][0]["articles"][2]["text"] == "Het kabinet had geen plan meer voor de asielcrisis.", "with teasers"
+    assert sorted(asked) == ["https://x.nl/2", "https://x.nl/3"], "only the picked pages, at most PAGES_PER_STORY a story"
     [story] = first["stories"]
     assert [a["title"] for a in story["articles"]] == ["Kabinet valt", "Dutch cabinet falls", "Waarom dit kabinet moest vallen"], \
         "a lone opinion column waits for more coverage, and a copy goes in once"
     assert story["articles"][0]["also_in"] == ["Tubantia"] and story["source_count"] == 3
+    assert [a["text"] for a in story["articles"]] == ["", pages["https://x.nl/2"],
+                                                      "Het kabinet had geen plan meer voor de asielcrisis."], \
+        "a picked page replaces the teaser, unless it holds little more"
+    assert "url" not in story["articles"][0]
     assert db.execute("SELECT headline, summary, region FROM stories WHERE id = 1").fetchone() == (
         "Dutch cabinet falls", "The cabinet fell.", "NL")
     assert db.execute("SELECT quote_en FROM quotes").fetchall() == [("The cabinet had no plan left",)], \
         "only word-for-word quotes from opinion articles"
     assert db.execute("SELECT id FROM articles WHERE written = 1 ORDER BY id").fetchall() == [(1,), (2,), (3,), (8,)]
-    assert abs(db.execute("SELECT usd FROM spend").fetchone()[0] - (1000 * 0.15 + 500 * 0.6) / 1e6) < 1e-12
+    assert abs(db.execute("SELECT usd FROM spend").fetchone()[0] - 2 * (1000 * 0.15 + 500 * 0.6) / 1e6) < 1e-12
 
     add_article(db, 5, 1, "NOS", "Koning aanvaardt ontslag", lang="nl")
     news.write(db)
@@ -336,6 +391,13 @@ def test_write():
         db.execute("UPDATE articles SET written = 0 WHERE id = 7")
         news.write(db)  # malformed replies are skipped, never fatal
     assert db.execute("SELECT text FROM updates ORDER BY id").fetchall() == [("The king accepted the resignation.",), ("x",)]
+
+    def broken(*_):
+        raise IndexError("list index out of range")
+
+    news.call_mistral = broken
+    db.execute("UPDATE articles SET written = 0 WHERE id = 7")
+    news.write(db)  # a request that breaks is skipped, never fatal
 
     db.execute("UPDATE spend SET usd = ?", (news.DAILY_BUDGET,))
     add_article(db, 6, 1, "BBC", "King accepts resignation")
@@ -393,8 +455,8 @@ def test_claude_writer():
         used.append(model)
         return reply(system, payload), (100, 10)
 
-    originals = news.call_claude, news.call_mistral, news.batches
-    news.call_claude, news.call_mistral = claude, mistral
+    originals = news.call_claude, news.call_mistral, news.batches, news.read_pages
+    news.call_claude, news.call_mistral, news.read_pages = claude, mistral, lambda *_: None
     news.batches = lambda stories, max_stories, max_articles: ([st] for st in stories)  # one story per request
     news.write(db)
     assert used == [news.CLAUDE_WRITER, news.CLAUDE_WRITER, news.WRITER], "Claude first, Mistral once Claude is out"
@@ -437,7 +499,7 @@ def test_claude_writer():
     news.call_claude = broken
     news.write(db)
     assert used == [news.CLAUDE_WRITER] * 3 + [news.WRITER] * 3, "three failures in a row hand the run to Mistral"
-    news.call_claude, news.call_mistral, news.batches = originals
+    news.call_claude, news.call_mistral, news.batches, news.read_pages = originals
     del os.environ["MISTRAL_API_KEY"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
 
 
@@ -877,6 +939,7 @@ test_group()
 test_translate_before_grouping()
 test_language_backfill()
 test_mistral_articles()
+test_fetch_page()
 test_write()
 test_claude_writer()
 test_tag()
