@@ -835,7 +835,8 @@ def read_pages(db, model, stories):
                 text = fetch_page(a["url"])
             except urllib.error.HTTPError as e:
                 if e.code in (401, 402, 403, 429):  # a bot wall, a paywall or a rate limit: skip the site this run
-                    blocked.update({a["outlet"], urlsplit(e.url).netloc})
+                    host = urlsplit(e.url).netloc  # Google limiting its links says nothing about the outlet
+                    blocked.update({host} if host == "news.google.com" else {host, a["outlet"]})
                 continue
             except Exception:  # a timeout or the network
                 continue
