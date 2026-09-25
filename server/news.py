@@ -351,7 +351,7 @@ def group(db):
     db.execute("UPDATE stories SET vec = NULL WHERE updated < ?", (iso(now() - 3 * OPEN_FOR),))
     # Committed before the slow parts (the model, the embedding), so a settings change from the app doesn't wait on them.
     db.commit()
-    if os.environ.get("MISTRAL_API_KEY"):
+    if available_writers():
         try:
             translate(db)
         except Exception as e:  # grouping on the Dutch text still works, just less well across languages
@@ -512,7 +512,8 @@ Keep names, numbers and meaning exactly; add nothing, leave out nothing, keep th
 
 
 def translate(db):
-    """English titles and teasers for Dutch articles, shown on the page and used for grouping."""
+    """English titles and teasers for Dutch articles, shown on the page and used for grouping. Claude translates when
+    it's set up, Mistral otherwise."""
     if db.execute("SELECT 1 FROM articles WHERE lang IS NULL LIMIT 1").fetchone():  # collected before lang existed
         db.executemany("UPDATE articles SET lang = ? WHERE lang IS NULL AND outlet = ?",
                        [(src["lang"], src["name"]) for src in load_sources(db)[0]])
@@ -520,9 +521,11 @@ def translate(db):
                    " WHERE lang IS NULL")
     todo = db.execute("SELECT id, title, summary FROM articles WHERE lang = 'nl' AND title_en IS NULL"
                       " AND published >= ?", (iso(now() - OPEN_FOR),)).fetchall()
-    for i in range(0, len(todo), 20):
-        batch = {r[0]: r for r in todo[i:i + 20]}
-        result = ask(db, TRANSLATOR, "translate",
+    # Each Claude Code request takes a while to start; Mistral's replies are capped at 4000 tokens.
+    model, size = (CLAUDE_WRITER, 100) if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") else (TRANSLATOR, 20)
+    for i in range(0, len(todo), size):
+        batch = {r[0]: r for r in todo[i:i + size]}
+        result = ask(db, model, "translate",
                      {"items": [{"id": a, "title": t, "text": s[:300]} for a, t, s in batch.values()]}, 4000)
         for item in result.get("items", []):
             if item.get("id") in batch and isinstance(item.get("title"), str) and item["title"].strip():
@@ -597,7 +600,7 @@ repeat it. Refer to stories by their key exactly as given ("s1")."""
 PROMPTS = {"translate": TRANSLATE_PROMPT, "rules": RULES, "new": NEW_PROMPT, "update": UPDATE_PROMPT, "tag": TAG_PROMPT,
            "report": REPORT_PROMPT}
 PROMPT_NOTES = {
-    "translate": ("Translation", "Mistral turns Dutch headlines and teasers into English. The reply format is added after it."),
+    "translate": ("Translation", "Turns Dutch headlines and teasers into English. The reply format is added after it."),
     "rules": ("Writing rules", "Added to the prompts for new stories and for updates."),
     "new": ("New stories", "Writes a new story's headline, summary and background. The places, the writing rules and "
                            "the reply format are added after it."),
@@ -620,6 +623,9 @@ QUOTES_SCHEMA = {"type": "array", "items": {"type": "object", "required": ["arti
                                              "properties": {"article": {"type": "string"}, "quote": {"type": "string"},
                                                             "quote_en": {"type": "string"}}}}
 SCHEMAS = {
+    "translate": {"type": "object", "required": ["items"], "properties": {"items": {"type": "array", "items": {
+        "type": "object", "required": ["id", "title", "text"],
+        "properties": {"id": {"type": "integer"}, "title": {"type": "string"}, "text": {"type": "string"}}}}}},
     "new": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
         "type": "object", "required": ["key", "headline", "summary", "background", "region"],
         "properties": {"key": {"type": "string"}, "headline": {"type": "string"}, "summary": {"type": "string"},

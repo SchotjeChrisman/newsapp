@@ -211,6 +211,21 @@ def test_translate_before_grouping():
     assert sorted(embedded) == ["Cabinet falls. The cabinet has fallen.", "Dutch cabinet falls. The Dutch cabinet has fallen."]
     del os.environ["MISTRAL_API_KEY"]
 
+    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "test"
+    add_article(db, 3, None, "NOS", "Storm raast over kust", lang="nl")
+    original = news.call_claude
+
+    def claude(model, system, payload, schema):
+        assert model == news.CLAUDE_WRITER and schema == news.SCHEMAS["translate"] and [i["id"] for i in payload["items"]] == [3]
+        return json.dumps({"items": [{"id": 3, "title": "Storm rages over coast", "text": ""}]}), 0.01
+
+    news.call_claude = claude
+    news.group(db)
+    assert db.execute("SELECT title_en FROM articles WHERE id = 3").fetchone() == ("Storm rages over coast",), \
+        "Claude translates without a Mistral key"
+    news.call_claude = original
+    del os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+
 
 def test_language_backfill():
     with tempfile.TemporaryDirectory() as tmp:
