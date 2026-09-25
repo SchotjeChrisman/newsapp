@@ -274,6 +274,8 @@ def test_fetch_page():
     assert news.fetch_page(as_data(paid)) == "", "a page the publisher marks as paid"
     zipped = "data:application/octet-stream;base64," + base64.b64encode(gzip.compress(page.encode())).decode()
     assert "de ‘Zwolse brug’" in news.fetch_page(zipped), "a page sent gzipped unasked"
+    zipped = "data:application/octet-stream;base64," + base64.b64encode(gzip.compress(paid.encode())).decode()
+    assert news.fetch_page(zipped) == "", "a paid page sent gzipped"
     wall, news.CONSENT_WALL = news.CONSENT_WALL, ""  # data: links have no host, like the wall is for this test
     consent = f"<script>const callbackUrl = new URL(decodeURIComponent('{urllib.parse.quote(as_data(page), safe='')}'))</script>"
     assert "de ‘Zwolse brug’" in news.fetch_page(as_data(consent)), "past the cookie wall by its own link"
@@ -311,7 +313,7 @@ def test_write():
     def fake(model, system, payload, max_tokens):
         calls.append((system, payload))
         if system.startswith(news.READ_PROMPT):
-            reply = {"stories": [{"key": "s1", "articles": [["a1"], "a2", "a9", "a2", "a3", "a1"]}]}
+            reply = {"stories": [{"key": "s1", "articles": [["a1"], "a2", "a9", "a2"]}, {"key": "s1", "articles": ["a3", "a1"]}]}
         elif system.startswith(news.NEW_PROMPT):
             reply = {"stories": [{"key": "s1", "headline": "Dutch cabinet falls", "summary": "The cabinet fell.", "region": "NL",
                                   "background": " The cabinet is the Dutch government. ",
@@ -332,7 +334,8 @@ def test_write():
     news.fetch_page, news.PAGES_PER_STORY = fetch_page, pages_per_story
     [(read_prompt, read), (_, first)] = calls
     assert read_prompt.startswith(news.READ_PROMPT) and "url" not in read["stories"][0]["articles"][0]
-    assert sorted(asked) == ["https://x.nl/2", "https://x.nl/3"], "only the picked pages, at most PAGES_PER_STORY"
+    assert read["stories"][0]["articles"][2]["text"] == "Het kabinet had geen plan meer voor de asielcrisis.", "with teasers"
+    assert sorted(asked) == ["https://x.nl/2", "https://x.nl/3"], "only the picked pages, at most PAGES_PER_STORY a story"
     [story] = first["stories"]
     assert [a["title"] for a in story["articles"]] == ["Kabinet valt", "Dutch cabinet falls", "Waarom dit kabinet moest vallen"], \
         "a lone opinion column waits for more coverage, and a copy goes in once"
@@ -388,6 +391,13 @@ def test_write():
         db.execute("UPDATE articles SET written = 0 WHERE id = 7")
         news.write(db)  # malformed replies are skipped, never fatal
     assert db.execute("SELECT text FROM updates ORDER BY id").fetchall() == [("The king accepted the resignation.",), ("x",)]
+
+    def broken(*_):
+        raise IndexError("list index out of range")
+
+    news.call_mistral = broken
+    db.execute("UPDATE articles SET written = 0 WHERE id = 7")
+    news.write(db)  # a request that breaks is skipped, never fatal
 
     db.execute("UPDATE spend SET usd = ?", (news.DAILY_BUDGET,))
     add_article(db, 6, 1, "BBC", "King accepts resignation")

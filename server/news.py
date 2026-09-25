@@ -800,7 +800,7 @@ def read_pages(db, model, stories):
             items = []
             for a in st["articles"]:
                 n += 1
-                keyed[f"a{n}"] = a
+                keyed[f"a{n}"] = (i, a)
                 items.append({"key": f"a{n}", "outlet": a["outlet"], "title": a["title"], "text": a["text"][:300]})
             payload.append({"key": f"s{i}", "articles": items})
         try:
@@ -808,14 +808,17 @@ def read_pages(db, model, stories):
         except (ClaudeUnavailable, OverBudget) as e:
             print(f"read: {e}", flush=True)
             break
-        except (ValueError, TypeError, KeyError, OSError, http.client.HTTPException) as e:
+        except (ValueError, TypeError, KeyError, AttributeError, IndexError, OSError, http.client.HTTPException) as e:
             print(f"read: batch skipped ({type(e).__name__}: {e})", flush=True)
             continue
+        chosen = defaultdict(dict)  # per story, however the reply groups its keys
         items = result.get("stories") if isinstance(result, dict) else None
         for item in items if isinstance(items, list) else []:
             keys = item.get("articles") if isinstance(item, dict) else None
-            keys = [k for k in keys if isinstance(k, str) and k in keyed] if isinstance(keys, list) else []
-            wanted += [keyed[k] for k in dict.fromkeys(keys)][:PAGES_PER_STORY]
+            for k in keys if isinstance(keys, list) else []:
+                if isinstance(k, str) and k in keyed and len(chosen[keyed[k][0]]) < PAGES_PER_STORY:
+                    chosen[keyed[k][0]][k] = keyed[k][1]
+        wanted += [a for i in sorted(chosen) for a in chosen[i].values()]
     picked, read, blocked = len(wanted), [], set()
     deadline = time.monotonic() + PAGES_WITHIN
 
@@ -825,13 +828,14 @@ def read_pages(db, model, stories):
                 a = wanted.pop(0)  # in the order the stories are written, most sources first
             except IndexError:
                 return
-            if urlsplit(a["url"]).netloc in blocked:
+            # By outlet too: a Google News link only shows its site once it's resolved, which Google limits.
+            if a["outlet"] in blocked or urlsplit(a["url"]).netloc in blocked:
                 continue
             try:
                 text = fetch_page(a["url"])
             except urllib.error.HTTPError as e:
                 if e.code in (401, 402, 403, 429):  # a bot wall, a paywall or a rate limit: skip the site this run
-                    blocked.add(urlsplit(e.url).netloc)
+                    blocked.update({a["outlet"], urlsplit(e.url).netloc})
                 continue
             except Exception:  # a timeout or the network
                 continue
