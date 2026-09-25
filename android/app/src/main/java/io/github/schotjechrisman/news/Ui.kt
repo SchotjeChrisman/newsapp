@@ -645,6 +645,10 @@ fun StoryScreen(story: Story, onBack: () -> Unit) {
                     }
                 }
             }
+            story.background?.let { background ->
+                item { SectionLabel("Background", Modifier.padding(start = 4.dp, top = 24.dp, bottom = 8.dp)) }
+                item { Text(background, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(horizontal = 4.dp)) }
+            }
             if (story.updates.isNotEmpty()) {
                 item { SectionLabel("Updates", Modifier.padding(start = 4.dp, top = 24.dp, bottom = 8.dp)) }
                 itemsIndexed(story.updates) { i, update ->
