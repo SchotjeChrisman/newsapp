@@ -217,7 +217,7 @@ def test_translate_before_grouping():
     add_article(db, 3, None, "NOS", "Storm raast over kust", lang="nl")
     original = news.call_claude
 
-    def claude(model, system, payload, schema):
+    def claude(model, system, payload, schema, effort):
         assert model == news.CLAUDE_WRITER and schema == news.SCHEMAS["translate"] and [i["id"] for i in payload["items"]] == [3]
         return json.dumps({"items": [{"id": 3, "title": "Storm rages over coast", "text": ""}]}), 0.01
 
@@ -419,6 +419,9 @@ def test_claude_writer():
     assert news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {}, news.SCHEMAS["new"]) == ('{"ok": 1}', 0.01)
     assert json.loads(calls[0][calls[0].index("--json-schema") + 1]) == news.SCHEMAS["new"]
     assert calls[0][calls[0].index("--tools") + 1] == "", "Claude Code's own tools are off"
+    assert calls[0][calls[0].index("--effort") + 1] == news.CLAUDE_EFFORT
+    news.call_claude("claude-sonnet-5", news.TAG_PROMPT, {}, {}, "medium")
+    assert calls[1][calls[1].index("--effort") + 1] == "medium"
     for run, error in ((Run(json.dumps({"is_error": True, "result": "Claude AI usage limit reached"}), 1), news.ClaudeUnavailable),
                        (Run(json.dumps({"is_error": True, "result": "x", "api_error_status": 401}), 1), news.ClaudeUnavailable),
                        (Run(json.dumps({"is_error": True, "subtype": "error_max_turns"}), 1), news.ClaudeFailed),
@@ -445,7 +448,8 @@ def test_claude_writer():
         return json.dumps({"stories": [{"key": st["key"], "headline": "H", "summary": "S", "region": "NL"}
                                        for st in payload["stories"]]})
 
-    def claude(model, system, payload, schema):
+    def claude(model, system, payload, schema, effort):
+        assert effort == news.CLAUDE_EFFORT
         used.append(model)
         if len(used) == 2:
             raise news.ClaudeUnavailable("Claude AI usage limit reached")
@@ -474,7 +478,7 @@ def test_claude_writer():
     db.commit()
     used.clear()
 
-    def flaky(model, system, payload, schema):
+    def flaky(model, system, payload, schema, effort):
         used.append(model)
         if len(used) == 1:
             raise news.ClaudeFailed("no reply within 10 minutes")
@@ -492,7 +496,7 @@ def test_claude_writer():
     db.commit()
     used.clear()
 
-    def broken(model, system, payload, schema):
+    def broken(model, system, payload, schema, effort):
         used.append(model)
         raise news.ClaudeFailed("unreadable reply")
 
@@ -516,7 +520,8 @@ def test_tag():
         add_article(db, aid, sid, "NOS", f"Article {aid}")
     seen = []
 
-    def unavailable(model, system, payload, schema):
+    def unavailable(model, system, payload, schema, effort):
+        seen.append(effort)
         raise news.ClaudeUnavailable("usage limit")
 
     def fake(model, system, payload, max_tokens):
@@ -526,14 +531,14 @@ def test_tag():
 
     news.call_claude, news.call_mistral = unavailable, fake
     news.tag(db)
-    assert seen == [["s1", "s2", "s3"]], "Mistral takes over; only written stories are sorted"
+    assert seen == [news.TAG_EFFORT, ["s1", "s2", "s3"]], "Mistral takes over; only written stories are sorted"
     assert db.execute("SELECT id, interests FROM stories ORDER BY id").fetchall() == [
         (1, '["Football"]'), (2, '["AI", "S&P 500"]'), (3, None), (4, None)], \
         "near-miss names count, unknown ones are dropped, and a story left out of the reply stays untagged"
     news.tag(db)
     assert seen[-1] == ["s1"], "a story is sorted once; one left out is sent again"
 
-    def failing(model, system, payload, schema):
+    def failing(model, system, payload, schema, effort):
         raise news.ClaudeFailed("unreadable reply")
 
     db.execute("UPDATE stories SET interests = NULL")

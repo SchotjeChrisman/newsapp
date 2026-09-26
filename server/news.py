@@ -120,6 +120,9 @@ DAILY_BUDGET = 0.60
 # it only guards the subscription against a runaway loop.
 CLAUDE_WRITER = "claude-sonnet-5"
 CLAUDE_EFFORT = "low"
+# Sorting the same 100 stories into interests twice changed 16 stories' interests at low effort and 7 at medium, which
+# costs about twice as much: a few cents per 100 stories.
+TAG_EFFORT = "medium"
 CLAUDE_DAILY_BUDGET = 50.00
 
 SCHEMA = """
@@ -504,12 +507,12 @@ class ClaudeFailed(ValueError):
     """One request went wrong (a timeout, an unreadable reply): that batch is tried again next run."""
 
 
-def call_claude(model, system, payload, schema):
+def call_claude(model, system, payload, schema, effort=CLAUDE_EFFORT):
     """One request through Claude Code in print mode: our system prompt instead of Claude Code's, no tools, one turn.
     Returns the reply text and Claude Code's API-equivalent cost estimate."""
     # --tools "" removes Claude Code's own tools; the JSON schema is answered through its structured-output tool,
     # which takes a second turn (a third if the first answer doesn't validate).
-    cmd = ["claude", "-p", "--model", model, "--effort", CLAUDE_EFFORT, "--system-prompt", system,
+    cmd = ["claude", "-p", "--model", model, "--effort", effort, "--system-prompt", system,
            "--output-format", "json", "--json-schema", json.dumps(schema), "--tools", "",
            "--max-turns", "3", "--no-session-persistence", "--disable-slash-commands", "--strict-mcp-config"]
     try:
@@ -549,7 +552,8 @@ def ask(db, model, kind, payload, max_tokens):
     if model.startswith("claude"):
         if claude_usd >= caps["claude"]:
             raise ClaudeUnavailable(f"daily Claude budget of ${caps['claude']:.2f} (API-equivalent) reached")
-        content, cost = call_claude(model, system, payload, reply_schema(db, kind))
+        content, cost = call_claude(model, system, payload, reply_schema(db, kind),
+                                    TAG_EFFORT if kind == "tag" else CLAUDE_EFFORT)
         db.execute("INSERT OR IGNORE INTO spend(day) VALUES (?)", (day,))
         db.execute("UPDATE spend SET claude_usd = COALESCE(claude_usd, 0) + ? WHERE day = ?", (cost, day))
     else:
