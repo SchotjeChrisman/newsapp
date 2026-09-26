@@ -44,6 +44,10 @@ COLLECT_WITHIN = 120  # seconds for all feeds together
 REPORT_HOUR = 5
 REPORT_PER_REGION = 5
 REPORT_PER_INTEREST = 3
+# Two stories in the report this similar (the cosine of their summed article vectors) are one event the grouping split:
+# only the first one listed stays, in a section the one more sources cover. In the reports of 23-26 September such pairs
+# scored 0.81-0.94, different news under 0.8.
+DOUBLE = 0.8
 # The S&P 500's last close: CNBC's quote service, Yahoo's chart API when CNBC doesn't answer (Yahoo rate-limits often).
 CNBC = ("https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols=.SPX&requestMethod=itv"
         "&noform=1&partnerId=2&fund=1&exthrs=1&output=json")
@@ -1084,18 +1088,33 @@ def morning(db, t=None):
     # Local midnight arithmetic, so a night with a clock change still starts the window at REPORT_HOUR.
     since = iso(datetime.combine(end.date() - timedelta(days=1), clock(REPORT_HOUR)).astimezone())
     stories = [s for s in shown(db) if s["headline"] and followed(s) and any(a[5] >= since for a in s["arts"])]
-    sections, picked = [], set()
+    vecs = {sid: np.frombuffer(blob, np.float32) for sid, blob in db.execute(
+        "SELECT id, vec FROM stories WHERE vec IS NOT NULL AND updated >= ?", (since,))}
+    sections, picked, seen = [], set(), []
+
+    def take(candidates, most):
+        """The first stories not in the report yet, skipping doubles of the ones it lists."""
+        chosen = []
+        for s in candidates:
+            if len(chosen) == most:
+                break
+            v = vecs.get(s["id"])
+            v = v / np.linalg.norm(v) if v is not None else None
+            if s["id"] in picked or v is not None and any(v @ w >= DOUBLE for w in seen):
+                continue
+            chosen.append(s)
+            picked.add(s["id"])
+            if v is not None:
+                seen.append(v)
+        return chosen
+
     for region, place in places(db).items():
-        major = [s for s in stories if region in s["regions"] and s["sources"] >= place["major"]][:REPORT_PER_REGION]
-        sections.append((region, major))
-        picked |= {s["id"] for s in major}
-    big = [s for s in stories if s["regions"] == [ELSEWHERE] and s["sources"] >= ELSEWHERE_SOURCES][:REPORT_PER_REGION]
-    sections.append((ELSEWHERE, big))
-    picked |= {s["id"] for s in big}
+        sections.append((region, take([s for s in stories if region in s["regions"] and s["sources"] >= place["major"]],
+                                      REPORT_PER_REGION)))
+    sections.append((ELSEWHERE, take([s for s in stories if s["regions"] == [ELSEWHERE] and s["sources"] >= ELSEWHERE_SOURCES],
+                                     REPORT_PER_REGION)))
     for interest in interests(db):
-        top = [s for s in stories if interest in s["interests"] and s["id"] not in picked][:REPORT_PER_INTEREST]
-        sections.append((interest, top))
-        picked |= {s["id"] for s in top}
+        sections.append((interest, take([s for s in stories if interest in s["interests"]], REPORT_PER_INTEREST)))
     listed = [s for _, section in sections for s in section]
     gist = gists(db, listed)
     body = {"day": day, "built": iso(now()), "since": since, "market": market(),
