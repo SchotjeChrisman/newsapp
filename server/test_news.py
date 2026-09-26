@@ -217,7 +217,7 @@ def test_translate_before_grouping():
     add_article(db, 3, None, "NOS", "Storm raast over kust", lang="nl")
     original = news.call_claude
 
-    def claude(model, system, payload, schema):
+    def claude(model, system, payload, schema, effort):
         assert model == news.CLAUDE_WRITER and schema == news.SCHEMAS["translate"] and [i["id"] for i in payload["items"]] == [3]
         return json.dumps({"items": [{"id": 3, "title": "Storm rages over coast", "text": ""}]}), 0.01
 
@@ -315,7 +315,7 @@ def test_write():
         if system.startswith(news.READ_PROMPT):
             reply = {"stories": [{"key": "s1", "articles": [["a1"], "a2", "a9", "a2"]}, {"key": "s1", "articles": ["a3", "a1"]}]}
         elif system.startswith(news.NEW_PROMPT):
-            reply = {"stories": [{"key": "s1", "headline": "Dutch cabinet falls", "summary": "The cabinet fell.", "region": "NL",
+            reply = {"stories": [{"key": "s1", "headline": "Dutch cabinet falls", "summary": "The cabinet fell.",
                                   "background": " The cabinet is the Dutch government. ",
                                   "quotes": [{"article": "a3", "quote": "“Het kabinet had geen plan meer”",
                                               "quote_en": "The cabinet had no plan left"},
@@ -345,19 +345,20 @@ def test_write():
         "a picked page replaces the teaser, unless it holds little more"
     assert "url" not in story["articles"][0]
     assert db.execute("SELECT headline, summary, region FROM stories WHERE id = 1").fetchone() == (
-        "Dutch cabinet falls", "The cabinet fell.", "NL")
+        "Dutch cabinet falls", "The cabinet fell.", None), "the tagger files it under a place"
     assert db.execute("SELECT quote_en FROM quotes").fetchall() == [("The cabinet had no plan left",)], \
         "only word-for-word quotes from opinion articles"
     assert db.execute("SELECT id FROM articles WHERE written = 1 ORDER BY id").fetchall() == [(1,), (2,), (3,), (8,)]
     assert abs(db.execute("SELECT usd FROM spend").fetchone()[0] - 2 * (1000 * 0.15 + 500 * 0.6) / 1e6) < 1e-12
 
     add_article(db, 5, 1, "NOS", "Koning aanvaardt ontslag", lang="nl")
+    db.execute("UPDATE stories SET region = 'NL', interests = '[]' WHERE id = 1")
     news.write(db)
     assert calls[-1][0].startswith(news.UPDATE_PROMPT)
     assert [a["title"] for a in calls[-1][1]["stories"][0]["articles"]] == ["Koning aanvaardt ontslag"], \
         "an update only gets the new articles"
-    assert db.execute("SELECT headline, summary FROM stories WHERE id = 1").fetchone() == (
-        "Dutch cabinet falls", "The cabinet fell."), "updates never rewrite the story"
+    assert db.execute("SELECT headline, summary, region, interests FROM stories WHERE id = 1").fetchone() == (
+        "Dutch cabinet falls", "The cabinet fell.", "NL", "[]"), "updates never rewrite the story or its tags"
     assert db.execute("SELECT text, articles FROM updates").fetchall() == [("The king accepted the resignation.", "[5]")], \
         "one sentence per new article, linked to it"
 
@@ -419,6 +420,9 @@ def test_claude_writer():
     assert news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {}, news.SCHEMAS["new"]) == ('{"ok": 1}', 0.01)
     assert json.loads(calls[0][calls[0].index("--json-schema") + 1]) == news.SCHEMAS["new"]
     assert calls[0][calls[0].index("--tools") + 1] == "", "Claude Code's own tools are off"
+    assert calls[0][calls[0].index("--effort") + 1] == news.CLAUDE_EFFORT
+    news.call_claude("claude-sonnet-5", news.TAG_PROMPT, {}, {}, "medium")
+    assert calls[1][calls[1].index("--effort") + 1] == "medium"
     for run, error in ((Run(json.dumps({"is_error": True, "result": "Claude AI usage limit reached"}), 1), news.ClaudeUnavailable),
                        (Run(json.dumps({"is_error": True, "result": "x", "api_error_status": 401}), 1), news.ClaudeUnavailable),
                        (Run(json.dumps({"is_error": True, "subtype": "error_max_turns"}), 1), news.ClaudeFailed),
@@ -445,7 +449,8 @@ def test_claude_writer():
         return json.dumps({"stories": [{"key": st["key"], "headline": "H", "summary": "S", "region": "NL"}
                                        for st in payload["stories"]]})
 
-    def claude(model, system, payload, schema):
+    def claude(model, system, payload, schema, effort):
+        assert effort == news.CLAUDE_EFFORT
         used.append(model)
         if len(used) == 2:
             raise news.ClaudeUnavailable("Claude AI usage limit reached")
@@ -474,7 +479,7 @@ def test_claude_writer():
     db.commit()
     used.clear()
 
-    def flaky(model, system, payload, schema):
+    def flaky(model, system, payload, schema, effort):
         used.append(model)
         if len(used) == 1:
             raise news.ClaudeFailed("no reply within 10 minutes")
@@ -492,7 +497,7 @@ def test_claude_writer():
     db.commit()
     used.clear()
 
-    def broken(model, system, payload, schema):
+    def broken(model, system, payload, schema, effort):
         used.append(model)
         raise news.ClaudeFailed("unreadable reply")
 
@@ -512,28 +517,36 @@ def test_tag():
     db.execute("INSERT INTO stories(id, updated, n, headline, summary) VALUES (1, ?, 1, 'Ajax beat PSV', 'Ajax won.'),"
                " (2, ?, 1, 'Nvidia shares rise', 'Nvidia rose.'), (3, ?, 1, 'Road works', 'A road closes.')", (t,) * 3)
     db.execute("INSERT INTO stories(id, updated, n) VALUES (4, ?, 1)", (t,))
+    db.execute("UPDATE stories SET region = 'US' WHERE id = 2")
+    db.execute("UPDATE stories SET region = 'Zwolle' WHERE id = 3")
     for aid, sid in ((11, 1), (12, 2), (13, 3), (14, 4)):
         add_article(db, aid, sid, "NOS", f"Article {aid}")
-    seen = []
+    seen, sent = [], []
 
-    def unavailable(model, system, payload, schema):
+    def unavailable(model, system, payload, schema, effort):
+        seen.append(effort)
         raise news.ClaudeUnavailable("usage limit")
 
     def fake(model, system, payload, max_tokens):
         seen.append([st["key"] for st in payload["stories"]])
-        return json.dumps({"stories": [{"key": "s1", "interests": ["football", "Basketball"]},
-                                       {"key": "s2", "interests": ["S&P500", "AI"]}]}), (10, 10)
+        sent.append(payload)
+        return json.dumps({"stories": [{"key": "s1", "interests": ["football", "Basketball"], "region": "NL"},
+                                       {"key": "s2", "interests": ["S&P500", "AI"], "region": "None"},
+                                       {"key": "s3", "region": "Mars"}]}), (10, 10)
 
     news.call_claude, news.call_mistral = unavailable, fake
     news.tag(db)
-    assert seen == [["s1", "s2", "s3"]], "Mistral takes over; only written stories are sorted"
+    assert seen == [news.TAG_EFFORT, ["s1", "s2", "s3"]], "Mistral takes over; only written stories are sorted"
+    assert sent[0]["stories"][0] == {"key": "s1", "headline": "Ajax beat PSV", "summary": "Ajax won."}
+    assert db.execute("SELECT id, region FROM stories ORDER BY id").fetchall() == [(1, "NL"), (2, None), (3, "Zwolle"), (4, None)], \
+        "filed under the place it answers, none for None, and an unknown place changes nothing"
     assert db.execute("SELECT id, interests FROM stories ORDER BY id").fetchall() == [
         (1, '["Football"]'), (2, '["AI", "S&P 500"]'), (3, None), (4, None)], \
         "near-miss names count, unknown ones are dropped, and a story left out of the reply stays untagged"
     news.tag(db)
     assert seen[-1] == ["s1"], "a story is sorted once; one left out is sent again"
 
-    def failing(model, system, payload, schema):
+    def failing(model, system, payload, schema, effort):
         raise news.ClaudeFailed("unreadable reply")
 
     db.execute("UPDATE stories SET interests = NULL")
@@ -554,6 +567,34 @@ def test_tag():
     news.tag(db)
     assert db.execute("SELECT COUNT(*) FROM stories WHERE interests IS NOT NULL").fetchone() == (0,), \
         "tags from interests the app has since changed are thrown away"
+
+    def moved_meanwhile(model, system, payload, max_tokens):
+        news.save_settings(db, {"places": [p | {"was": p["name"]} for p in news.settings_json(db)["places"]][:-1]})
+        return fake(model, system, payload, max_tokens)
+
+    news.call_mistral = moved_meanwhile
+    news.tag(db)
+    assert db.execute("SELECT COUNT(*) FROM stories WHERE interests IS NOT NULL").fetchone() == (0,), \
+        "and so are places from before the app changed them"
+
+    def recounted_meanwhile(model, system, payload, max_tokens):
+        news.save_settings(db, {"places": [p | {"was": p["name"], "major": 7} for p in news.settings_json(db)["places"]]})
+        return fake(model, system, payload, max_tokens)
+
+    db.execute("UPDATE stories SET interests = NULL, region = NULL")
+    news.call_mistral = recounted_meanwhile
+    news.tag(db)
+    assert db.execute("SELECT region FROM stories WHERE id = 1").fetchone() == ("NL",), \
+        "a new number of sources for the report doesn't throw the pass away"
+    assert news.system_prompt(db, "tag").startswith("\n".join([news.TAG_PROMPT, news.PLACE_PROMPT, "Places:\n- Zwolle: "]))
+
+    news.save_settings(db, {"interests": []})
+    assert news.reply_schema(db, "tag")["properties"]["stories"]["items"]["properties"]["interests"] == {
+        "type": "array", "maxItems": 0}
+    db.execute("UPDATE stories SET interests = NULL, region = NULL")
+    news.call_mistral = fake
+    news.tag(db)
+    assert db.execute("SELECT region FROM stories WHERE id = 1").fetchone() == ("NL",), "filed without interests too"
     news.call_claude, news.call_mistral = originals
     del os.environ["MISTRAL_API_KEY"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
 
@@ -580,7 +621,7 @@ def test_notable():
         (1, '["AI"]', 1), (2, "[]", 0), (3, "[]", None), (4, '["AI"]', 0)], "a story without an interest is never notable"
     news.tag(db)
     assert len(sent) == 1, "each story once"
-    assert news.reply_schema(db, "tag")["properties"]["stories"]["items"]["required"] == ["key", "interests", "notable"]
+    assert news.reply_schema(db, "tag")["properties"]["stories"]["items"]["required"] == ["key", "interests", "notable", "region"]
     news.call_claude, news.call_mistral = originals
     del os.environ["MISTRAL_API_KEY"]
 
@@ -598,21 +639,26 @@ def test_morning():
                                              (4, "US", ["AI"], ["CNN", "Fox News", "NPR"]),
                                              (5, "Global", [], [f"Outlet {i}" for i in range(12)]),
                                              (6, "Elsewhere", ["AI"], ["BBC", "DW"]),
-                                             (7, "Elsewhere", [], [f"Outlet {i}" for i in range(30)])):
+                                             (7, "Elsewhere", [], [f"Outlet {i}" for i in range(30)]),
+                                             (8, "NL", [], [f"Outlet {i}" for i in range(5)]),
+                                             (9, "NL", ["Football"], [f"Outlet {i}" for i in range(5)])):
         db.execute("INSERT INTO stories(id, updated, n, headline, summary, region, interests) VALUES (?,?,?,?,?,?,?)",
                    (sid, t, len(outlets), f"Headline {sid}", f"Story number {sid} happened today. Then more.", region,
                     json.dumps(interests)))
         age = timedelta(hours=30 if sid == 5 else 1)
         for i, outlet in enumerate(outlets):
             add_article(db, sid * 100 + i, sid, outlet, f"Title {sid} {i}", age=age)
+    for sid, vec in ((1, [3, 0, 0]), (8, [2.7, 0.6, 0]), (9, [0.5, 3, 0]), (2, [0.6, 2.7, 0.3])):  # sums, not unit vectors
+        db.execute("UPDATE stories SET vec = ? WHERE id = ?", (np.array(vec, np.float32).tobytes(), sid))
     news.morning(db, datetime(2026, 9, 23, 4, 50, tzinfo=UTC).astimezone() - timedelta(hours=2))
     assert db.execute("SELECT COUNT(*) FROM reports").fetchone() == (0,), "no report before REPORT_HOUR"
     news.morning(db, fixed.astimezone())
     report = news.latest_report(db)
     assert report["day"] == "2026-09-23" and report["market"]["change"] == -0.5
     assert [(sec["title"], [st["id"] for st in sec["stories"]]) for sec in report["sections"]] == [
-        ("Zwolle", [3]), ("NL", [1]), ("Elsewhere", [7]), ("AI", [4]), ("Football", [2])], \
-        "major stories per region, then interests; old news, small stories and minor ones from elsewhere stay out"
+        ("Zwolle", [3]), ("NL", [1, 9]), ("Elsewhere", [7]), ("AI", [4])], \
+        "major stories per region, then interests; old news, small stories, minor ones from elsewhere and a second story" \
+        " about an event already listed (8 of 1, 2 of 9) stay out"
     assert report["sections"][1]["stories"][0] == {"id": 1, "headline": "Headline 1", "gist": "Story number 1 happened today.",
                                                   "sources": 6}, "without a writer the gist is the summary's first sentence"
     news.morning(db, fixed.astimezone())
@@ -699,9 +745,9 @@ def test_elsewhere():
         for i in range(sources):
             add_article(db, sid * 100 + i, sid, f"Outlet {i}", f"Story {sid} from outlet {i}")
     news.call_mistral = lambda model, system, payload, max_tokens: (json.dumps({"stories": [
-        {"key": st["key"], "headline": "H", "summary": "S", "region": "Elsewhere"} for st in payload["stories"]]}), (10, 10))
+        {"key": st["key"], "headline": "H", "summary": "S"} for st in payload["stories"]]}), (10, 10))
     news.write(db)
-    assert db.execute("SELECT DISTINCT region FROM stories").fetchall() == [("Elsewhere",)]
+    db.execute("UPDATE stories SET region = 'Elsewhere'")
     assert sorted(s["id"] for s in news.api(db)["stories"]) == [3, 5], \
         "from a place the reader doesn't follow, only what 30 sources cover, or 5 and it fits a subject"
     db.execute("UPDATE stories SET region = NULL WHERE id = 1")
@@ -811,7 +857,7 @@ def test_settings():
     edited = [p | {"was": p["name"]} for p in edited if p["name"] != "Overijssel"]
     edited[1] |= {"name": "Netherlands"}
     edited.append({"name": "Deventer", "about": "the city of Deventer", "major": 2, "was": None})
-    assert news.save_settings(db, {"places": edited}) is False
+    assert news.save_settings(db, {"places": edited}) is True, "the recent stories are filed again"
     assert [p["name"] for p in news.settings_json(db)["places"]] == ["Zwolle", "Netherlands", "EU", "US", "Global", "Deventer"]
     regions = {s["url"]: s["region"] for s in news.load_sources(db)[0]}
     bundled = {s["url"]: s["region"] for s in news.load_sources()[0]}
@@ -821,8 +867,10 @@ def test_settings():
     assert db.execute("SELECT id, region FROM stories WHERE id > 1 ORDER BY id").fetchall() == [
         (2, "Netherlands"), (3, None), (4, "Zwolle")]
     assert db.execute("SELECT region FROM articles WHERE id = 30").fetchone() == ("Netherlands",)
-    assert "- Deventer: the city of Deventer" in news.system_prompt(db, "new")
-    assert news.reply_schema(db, "new")["properties"]["stories"]["items"]["properties"]["region"]["enum"] == [
+    assert "- Deventer: the city of Deventer" in news.system_prompt(db, "tag")
+    assert news.save_settings(db, {"places": [p | {"was": p["name"], "major": 9} for p in news.settings_json(db)["places"]]}) \
+        is False, "a number of sources for the report files nothing again"
+    assert news.reply_schema(db, "tag")["properties"]["stories"]["items"]["properties"]["region"]["enum"] == [
         "Zwolle", "Netherlands", "EU", "US", "Global", "Deventer", "Elsewhere", "None"]
     feeds = news.settings_json(db)["sources"]
     news.save_settings(db, {"sources": feeds})
@@ -865,8 +913,7 @@ def test_settings():
             pass
 
     news.save_settings(db, {"prompts": {"rules": "Rules: be brief.", "report": news.REPORT_PROMPT + "\n"}})
-    new = news.system_prompt(db, "new")
-    assert new.startswith(news.NEW_PROMPT + "\nPlaces:\n- ") and new.endswith("\nRules: be brief.\n" + news.FORMATS["new"])
+    assert news.system_prompt(db, "new") == "\n".join([news.NEW_PROMPT, "Rules: be brief.", news.FORMATS["new"]])
     assert news.setting(db, "prompts", None) == {"rules": "Rules: be brief."}, "a prompt set back to its default isn't stored"
     news.save_settings(db, {"prompts": {"rules": ""}})
     assert news.system_prompt(db, "new").endswith("\n".join(["", news.RULES, news.FORMATS["new"]]))

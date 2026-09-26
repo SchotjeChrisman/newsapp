@@ -5,7 +5,6 @@ import email.utils
 import fnmatch
 import gzip
 import html
-import copy
 import http.client
 import json
 import os
@@ -44,6 +43,10 @@ COLLECT_WITHIN = 120  # seconds for all feeds together
 REPORT_HOUR = 5
 REPORT_PER_REGION = 5
 REPORT_PER_INTEREST = 3
+# Two stories in the report this similar (the cosine of their summed article vectors) are one event the grouping split:
+# only the first one listed stays, in a section the one more sources cover. In the reports of 23-26 September such pairs
+# scored 0.81-0.94, different news under 0.8.
+DOUBLE = 0.8
 # The S&P 500's last close: CNBC's quote service, Yahoo's chart API when CNBC doesn't answer (Yahoo rate-limits often).
 CNBC = ("https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols=.SPX&requestMethod=itv"
         "&noform=1&partnerId=2&fund=1&exthrs=1&output=json")
@@ -59,7 +62,7 @@ FADE = timedelta(hours=12)
 # those the lift at least doubles.
 NOTABLE_TOP = 3
 NOTABLE_LIFT = 0.4
-# The writer files a story about a place the reader doesn't follow as Elsewhere. The app leaves those out, unless
+# The tagger files a story about a place the reader doesn't follow as Elsewhere. The app leaves those out, unless
 # ELSEWHERE_SOURCES independent sources cover one, or ELSEWHERE_SUBJECT_SOURCES and it fits a subject.
 ELSEWHERE = "Elsewhere"
 ELSEWHERE_SOURCES = 30
@@ -75,19 +78,21 @@ OPINION = re.compile(r"/(columns?-opinie|opinie|opinions?|columns?|commentisfree
 # Google News links hide the section, so its opinion pieces are recognized by the label in the headline.
 OPINION_TITLE = re.compile(r"^(opinion|opinie|column)\s*[|:]|\|\s*(opinion|opinie|column)\s*$", re.I)
 TAG = re.compile(r"<[^>]+>")
-# The places the reader follows, each a part of the morning report: what belongs in it (the writer files a story under
-# the most specific place it's about, or Elsewhere), and how many independent sources make a story major enough for the
+# The places the reader follows, each a part of the morning report: what belongs in it (the tagger files a story under
+# the place it's about by PLACE_PROMPT, or Elsewhere), and how many independent sources make a story major enough for the
 # report. The feeds in sources.toml are grouped by these names. The app's settings can change them, like the interests
 # below.
 PLACES = {
     "Zwolle": {"about": "the city of Zwolle", "major": 2},
-    "Overijssel": {"about": "the province of Overijssel outside Zwolle", "major": 2},
-    "NL": {"about": "the Netherlands outside Overijssel, or the country as a whole", "major": 5},
+    "Overijssel": {"about": "the province of Overijssel outside Zwolle: Deventer, Enschede, Hengelo, Almelo, Kampen and "
+                             "the rest of Twente, Salland and the Vechtdal. Not the other provinces", "major": 2},
+    "NL": {"about": "the rest of the Netherlands, including local news from any other province, and the country as a "
+                    "whole", "major": 5},
     "EU": {"about": "the EU's institutions and politics, and news from other European countries that matters beyond their "
                     "borders", "major": 6},
     "US": {"about": "the United States", "major": 8},
     "Global": {"about": "world news that matters beyond the country it happens in: wars, diplomacy, disasters, major "
-                        "elections", "major": 10},
+                        "elections. Not sport, entertainment or business news", "major": 10},
 }
 REGIONS = list(PLACES)
 DUTCH_REGIONS = {"Zwolle", "Overijssel", "NL"}  # sources there write Dutch unless sources.toml says otherwise
@@ -116,6 +121,9 @@ DAILY_BUDGET = 0.60
 # it only guards the subscription against a runaway loop.
 CLAUDE_WRITER = "claude-sonnet-5"
 CLAUDE_EFFORT = "low"
+# Sorting the same 100 stories into interests twice changed 16 stories' interests at low effort and 7 at medium, which
+# costs about twice as much: a few cents per 100 stories.
+TAG_EFFORT = "medium"
 CLAUDE_DAILY_BUDGET = 50.00
 
 SCHEMA = """
@@ -500,12 +508,12 @@ class ClaudeFailed(ValueError):
     """One request went wrong (a timeout, an unreadable reply): that batch is tried again next run."""
 
 
-def call_claude(model, system, payload, schema):
+def call_claude(model, system, payload, schema, effort=CLAUDE_EFFORT):
     """One request through Claude Code in print mode: our system prompt instead of Claude Code's, no tools, one turn.
     Returns the reply text and Claude Code's API-equivalent cost estimate."""
     # --tools "" removes Claude Code's own tools; the JSON schema is answered through its structured-output tool,
     # which takes a second turn (a third if the first answer doesn't validate).
-    cmd = ["claude", "-p", "--model", model, "--effort", CLAUDE_EFFORT, "--system-prompt", system,
+    cmd = ["claude", "-p", "--model", model, "--effort", effort, "--system-prompt", system,
            "--output-format", "json", "--json-schema", json.dumps(schema), "--tools", "",
            "--max-turns", "3", "--no-session-persistence", "--disable-slash-commands", "--strict-mcp-config"]
     try:
@@ -545,7 +553,8 @@ def ask(db, model, kind, payload, max_tokens):
     if model.startswith("claude"):
         if claude_usd >= caps["claude"]:
             raise ClaudeUnavailable(f"daily Claude budget of ${caps['claude']:.2f} (API-equivalent) reached")
-        content, cost = call_claude(model, system, payload, reply_schema(db, kind))
+        content, cost = call_claude(model, system, payload, reply_schema(db, kind),
+                                    TAG_EFFORT if kind == "tag" else CLAUDE_EFFORT)
         db.execute("INSERT OR IGNORE INTO spend(day) VALUES (?)", (day,))
         db.execute("UPDATE spend SET claude_usd = COALESCE(claude_usd, 0) + ? WHERE day = ?", (cost, day))
     else:
@@ -632,9 +641,7 @@ possibly in Dutch. For every story write:
   60 words, shown apart from the summary, which still says only what the articles say. Only settled facts you are sure
   of that can't have changed since you learned them: nothing about this event itself, nobody's current office, status or
   whereabouts, no figures or rankings, no significance, predictions or opinions. Empty when the summary is clear
-  without it or when you're unsure.
-- region: the most specific place the story is about, from the places below. Elsewhere when it is about a place none
-  of them covers; the reader doesn't follow it. None when it is about no place (a product launch, a study, an album)."""
+  without it or when you're unsure."""
 
 UPDATE_PROMPT = """You keep a running story in a private news app up to date. You get its current text (headline,
 summary, earlier updates) and new articles. For each new article that states something the current text doesn't have
@@ -642,14 +649,26 @@ yet, write at most one English sentence with only what that article itself says,
 the current text or the other articles, and no day, date, number or name the article doesn't give. Skip articles that
 add nothing new; most stories need one or two sentences, some none."""
 
-TAG_PROMPT = """You sort the stories of a private news app into the reader's interests. For each story, list the
-interests it is about, from the list below. A story can have several interests or none; most stories have none. Pick an
-interest only when the story itself is about it, not when it comes up in passing. Include every story, with an empty
-list when no interest fits, and refer to stories by their key exactly as given ("s1").
+PLACE_PROMPT = """A story's region is the place it is about, from the places below: where it happens, or the country whose
+news it is. Decide by place alone, never by how big or important the story is: the app weighs coverage itself and still
+shows big stories from elsewhere.
+- News about a country as a whole, like its national team, government or weather, or about many places across it, goes
+  under that country, even when part of it takes place in one town (a national team match in Deventer: NL).
+- Otherwise a story that happens in or directly involves one of the smaller places goes under the smallest one, even
+  when places outside it are involved too (a clinic for Meppel and Zwolle: Zwolle; an event held in Ootmarsum: Overijssel).
+- Sport, entertainment, celebrities and business go under the place they are about, like any other story.
+- Elsewhere when it is about a place none of them covers. None when it is about no place (a product launch, a study,
+  an album)."""
+
+TAG_PROMPT = """You sort the stories of a private news app into the reader's interests and file them under a place. For
+each story, list the interests it is about, from the list below. A story can have several interests or none; most
+stories have none. Pick an interest only when the story itself is about it, not when it comes up in passing. Include
+every story, with an empty list when no interest fits, and refer to stories by their key exactly as given ("s1").
 Also say whether each story is notable: true when someone who follows one of its interests closely would want to know
 about it even if only one outlet reports it, like a new AI model, a major launch, breach or ruling, or a big transfer or
 result; false for routine items like reviews, how-tos, deals, rumours, previews, opinion and minor updates, and for
-stories without an interest."""
+stories without an interest.
+And give each story's region, by the rules for places below."""
 
 REPORT_PROMPT = """You write the morning report of a private news app. For each story write one plain English sentence of at
 most 18 words, two lines on a phone, that says what happened, including the latest update if there is one. Use only the given headline,
@@ -658,28 +677,30 @@ repeat it. Refer to stories by their key exactly as given ("s1")."""
 
 # The prompts by kind, with their name and what the app says about them. The app can replace each text; the code adds
 # the writing rules, the interests and the reply format, which it depends on and so can't be changed.
-PROMPTS = {"translate": TRANSLATE_PROMPT, "rules": RULES, "read": READ_PROMPT, "new": NEW_PROMPT,
+PROMPTS = {"translate": TRANSLATE_PROMPT, "rules": RULES, "places": PLACE_PROMPT, "read": READ_PROMPT, "new": NEW_PROMPT,
            "update": UPDATE_PROMPT, "tag": TAG_PROMPT, "report": REPORT_PROMPT}
 PROMPT_NOTES = {
     "translate": ("Translation", "Turns Dutch headlines and teasers into English. The reply format is added after it."),
     "rules": ("Writing rules", "Added to the prompts for new stories and for updates."),
+    "places": ("Places", "How stories are filed under a place. Added to the interests prompt, with the places after it."),
     "read": ("Reading", "Picks from headlines and teasers the articles whose full page is read before a story is "
                         "written. The reply format is added after it."),
-    "new": ("New stories", "Writes a new story's headline, summary and background. The places, the writing rules and "
-                           "the reply format are added after it."),
+    "new": ("New stories", "Writes a new story's headline, summary and background. The writing rules and the reply "
+                           "format are added after it."),
     "update": ("Updates", "Adds a sentence to a story for each new article. The writing rules and the reply format are added "
                           "after it."),
-    "tag": ("Interests", "Sorts stories into your interests. The interests and the reply format are added after it."),
+    "tag": ("Interests and places", "Sorts stories into your interests and files them under a place. The rules for places, "
+                                    "the places, the interests and the reply format are added after it."),
     "report": ("Morning report", "Writes the one-sentence gists of the morning report. The reply format is added after it."),
 }
 FORMATS = {
     "translate": 'Return JSON: {"items": [{"id": <id>, "title": "<English title>", "text": "<English text>"}]}',
     "read": 'Return JSON: {"stories": [{"key": "s1", "articles": ["a1", "a3"]}]}',
-    "new": """Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "background": "", "region": "...",
+    "new": """Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "background": "",
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}""",
     "update": """Return JSON: {"stories": [{"key": "s1", "facts": [{"article": "a1", "fact": "..."}],
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}""",
-    "tag": 'Return JSON: {"stories": [{"key": "s1", "interests": ["AI", "Tech"], "notable": false}]}',
+    "tag": 'Return JSON: {"stories": [{"key": "s1", "interests": ["AI", "Tech"], "notable": false, "region": "NL"}]}',
     "report": 'Return JSON: {"stories": [{"key": "s1", "gist": "..."}]}',
 }
 
@@ -694,10 +715,9 @@ SCHEMAS = {
         "type": "object", "required": ["key", "articles"],
         "properties": {"key": {"type": "string"}, "articles": {"type": "array", "items": {"type": "string"}}}}}}},
     "new": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
-        "type": "object", "required": ["key", "headline", "summary", "background", "region"],
+        "type": "object", "required": ["key", "headline", "summary", "background"],
         "properties": {"key": {"type": "string"}, "headline": {"type": "string"}, "summary": {"type": "string"},
-                       "background": {"type": "string"},
-                       "region": {"enum": REGIONS + [ELSEWHERE, "None"]}, "quotes": QUOTES_SCHEMA}}}}},
+                       "background": {"type": "string"}, "quotes": QUOTES_SCHEMA}}}}},
     "update": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
         "type": "object", "required": ["key", "facts"],
         "properties": {"key": {"type": "string"}, "quotes": QUOTES_SCHEMA, "facts": {"type": "array", "items": {
@@ -710,31 +730,29 @@ SCHEMAS = {
 
 
 def system_prompt(db, kind):
-    """A prompt as the model gets it: its text (the app's when it changed it), then the places, the writing rules or the
-    interests where they belong, then the reply format."""
+    """A prompt as the model gets it: its text (the app's when it changed it), then the writing rules, or the rules for
+    places, the places and the interests, where they belong, then the reply format."""
     edited = setting(db, "prompts", {})
     parts = [edited.get(kind) or PROMPTS[kind]]
-    if kind == "new":
-        parts.append("Places:\n" + "\n".join(f"- {name}: {place['about']}" for name, place in places(db).items()))
     if kind in ("new", "update"):
         parts.append(edited.get("rules") or RULES)
     if kind == "tag":
+        parts.append(edited.get("places") or PLACE_PROMPT)
+        parts.append("Places:\n" + "\n".join(f"- {name}: {place['about']}" for name, place in places(db).items()))
         parts.append("Interests:\n" + "\n".join(f"- {name}: {about}" for name, about in interests(db).items()))
     return "\n".join(parts + [FORMATS[kind]])
 
 
 def reply_schema(db, kind):
     """What Claude Code checks a reply against; the places and interests can change, so their names go in here."""
-    if kind == "new":
-        schema = copy.deepcopy(SCHEMAS["new"])
-        schema["properties"]["stories"]["items"]["properties"]["region"] = {"enum": list(places(db)) + [ELSEWHERE, "None"]}
-        return schema
     if kind != "tag":
         return SCHEMAS[kind]
+    wanted = list(interests(db))
     return {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
-        "type": "object", "required": ["key", "interests", "notable"],
-        "properties": {"key": {"type": "string"}, "interests": {"type": "array", "items": {"enum": list(interests(db))}},
-                       "notable": {"type": "boolean"}}}}}}
+        "type": "object", "required": ["key", "interests", "notable", "region"],
+        "properties": {"key": {"type": "string"}, "notable": {"type": "boolean"},
+                       "interests": {"type": "array", "items": {"enum": wanted}} if wanted else {"type": "array", "maxItems": 0},
+                       "region": {"enum": list(places(db)) + [ELSEWHERE, "None"]}}}}}}
 
 QUOTE_MARKS = str.maketrans({c: "'" for c in "‘’‚‛"} | {c: '"' for c in "“”„‟«»"})
 
@@ -926,7 +944,6 @@ def write(db):
                         if not writers:
                             raise OverBudget("no writer available") from e
                 items = result.get("stories") if isinstance(result, dict) else None
-                known = places(db)  # as they are now: the app may have renamed one while the model was writing
                 for item in items if isinstance(items, list) else []:
                     key = item.get("key") if isinstance(item, dict) else None
                     st, articles = keyed.pop(key, (None, None)) if isinstance(key, str) else (None, None)
@@ -936,12 +953,10 @@ def write(db):
                         headline, summary = str(item.get("headline") or "").strip(), str(item.get("summary") or "").strip()
                         if not headline or not summary:
                             continue
-                        region, background = item.get("region"), item.get("background")
-                        region = region if isinstance(region, str) and region in [*known, ELSEWHERE] else None
+                        background = item.get("background")
                         background = background.strip() or None if isinstance(background, str) else None
-                        db.execute("UPDATE stories SET headline = ?, summary = ?, background = ?, region = ?,"
-                                   " summary_articles = ? WHERE id = ?",
-                                   (headline, summary, background, region, json.dumps(st["ids"]), st["id"]))
+                        db.execute("UPDATE stories SET headline = ?, summary = ?, background = ?, summary_articles = ?"
+                                   " WHERE id = ?", (headline, summary, background, json.dumps(st["ids"]), st["id"]))
                         written += 1
                     else:
                         # One sentence per new article, each linked to that article (and its word-for-word copies).
@@ -971,13 +986,11 @@ def write(db):
 
 
 def tag(db):
-    """Sorts the written stories into the reader's interests, 100 per request, and marks the notable ones. A story is
-    tagged once; one the reply leaves out is sent again next run, like one sorted before notable existed. When Claude
-    fails, Mistral tags the rest of the run."""
+    """Sorts the written stories into the reader's interests and files them under a place, 100 per request, and marks
+    the notable ones. A story is tagged once; one the reply leaves out is sent again next run, like one sorted before
+    notable existed. When Claude fails, Mistral tags the rest of the run."""
     writers = available_writers()
-    wanted = interests(db)
-    if not wanted:
-        return
+    wanted, where = interests(db), {name: place["about"] for name, place in places(db).items()}
     names = {re.sub(r"\W", "", name).casefold(): name for name in wanted}  # Mistral may write "S&P500" or "football"
     rows = db.execute("SELECT id, headline, summary FROM stories WHERE updated >= ? AND headline IS NOT NULL"
                       " AND (interests IS NULL OR notable IS NULL AND interests != '[]') ORDER BY id",
@@ -990,17 +1003,20 @@ def tag(db):
                                for i, (_, headline, summary) in enumerate(batch, 1)]}
         try:
             result = ask(db, writers[0], "tag", payload, 4000)
-            # The app may have changed the interests while the model was sorting; then the pass it started sorts
-            # these stories again. Checked with the write lock held, so a change can't slip in before the writes.
+            # The app may have changed the interests or places while the model was sorting; then the pass it started
+            # sorts these stories again. Checked with the write lock held, so a change can't slip in before the writes.
             db.execute("BEGIN IMMEDIATE")
-            if interests(db) != wanted:
+            if interests(db) != wanted or {name: place["about"] for name, place in places(db).items()} != where:
                 db.rollback()
-                print("tag: the interests changed, sorted again in the next pass", flush=True)
+                print("tag: the interests or places changed, sorted again in the next pass", flush=True)
                 break
             items = result.get("stories") if isinstance(result, dict) else None
             for item in items if isinstance(items, list) else []:
                 key = item.get("key") if isinstance(item, dict) else None
                 sid = keyed.pop(key, None) if isinstance(key, str) else None
+                region = item.get("region") if sid else None
+                if region in [*where, ELSEWHERE, "None"]:
+                    db.execute("UPDATE stories SET region = ? WHERE id = ?", (None if region == "None" else region, sid))
                 answer = item.get("interests") if sid else None
                 if isinstance(answer, list):
                     given = {names.get(re.sub(r"\W", "", x).casefold()) for x in answer if isinstance(x, str)}
@@ -1084,18 +1100,33 @@ def morning(db, t=None):
     # Local midnight arithmetic, so a night with a clock change still starts the window at REPORT_HOUR.
     since = iso(datetime.combine(end.date() - timedelta(days=1), clock(REPORT_HOUR)).astimezone())
     stories = [s for s in shown(db) if s["headline"] and followed(s) and any(a[5] >= since for a in s["arts"])]
-    sections, picked = [], set()
+    vecs = {sid: np.frombuffer(blob, np.float32) for sid, blob in db.execute(
+        "SELECT id, vec FROM stories WHERE vec IS NOT NULL AND updated >= ?", (since,))}
+    sections, picked, seen = [], set(), []
+
+    def take(candidates, most):
+        """The first stories not in the report yet, skipping doubles of the ones it lists."""
+        chosen = []
+        for s in candidates:
+            if len(chosen) == most:
+                break
+            v = vecs.get(s["id"])
+            v = v / np.linalg.norm(v) if v is not None else None
+            if s["id"] in picked or v is not None and any(v @ w >= DOUBLE for w in seen):
+                continue
+            chosen.append(s)
+            picked.add(s["id"])
+            if v is not None:
+                seen.append(v)
+        return chosen
+
     for region, place in places(db).items():
-        major = [s for s in stories if region in s["regions"] and s["sources"] >= place["major"]][:REPORT_PER_REGION]
-        sections.append((region, major))
-        picked |= {s["id"] for s in major}
-    big = [s for s in stories if s["regions"] == [ELSEWHERE] and s["sources"] >= ELSEWHERE_SOURCES][:REPORT_PER_REGION]
-    sections.append((ELSEWHERE, big))
-    picked |= {s["id"] for s in big}
+        sections.append((region, take([s for s in stories if region in s["regions"] and s["sources"] >= place["major"]],
+                                      REPORT_PER_REGION)))
+    sections.append((ELSEWHERE, take([s for s in stories if s["regions"] == [ELSEWHERE] and s["sources"] >= ELSEWHERE_SOURCES],
+                                     REPORT_PER_REGION)))
     for interest in interests(db):
-        top = [s for s in stories if interest in s["interests"] and s["id"] not in picked][:REPORT_PER_INTEREST]
-        sections.append((interest, top))
-        picked |= {s["id"] for s in top}
+        sections.append((interest, take([s for s in stories if interest in s["interests"]], REPORT_PER_INTEREST)))
     listed = [s for _, section in sections for s in section]
     gist = gists(db, listed)
     body = {"day": day, "built": iso(now()), "since": since, "market": market(),
@@ -1287,7 +1318,7 @@ def shown(db, ids=None):
         if sources < 2 and all(a[6] for a in arts):
             continue  # a lone opinion column waits until the topic gets more coverage
         headline, summary, region, summary_articles, interests, notable, background = written.get(sid, (None,) * 7)
-        # Once written, the region is Mistral's reading of what the story is about; before that, the outlets' regions.
+        # Once written, the region is the tagger's reading of what the story is about; before that, the outlets' regions.
         regions = ([region] if region else []) if headline else sorted({a[2] for a in arts if a[2]})
         stories.append(dict(id=sid, arts=arts, sources=sources, headline=headline, summary=summary, regions=regions,
                             summary_articles=summary_articles, interests=json.loads(interests or "[]"), notable=bool(notable),
@@ -1514,7 +1545,7 @@ def field(item, key):
 
 def save_settings(db, changes):
     """Checks and stores the parts of the settings the app sends; a ValueError's message is shown in the app. Returns
-    whether the interests changed: the recent stories are then sorted again."""
+    whether the interests or places changed: the recent stories are then sorted and filed again."""
     if not isinstance(changes, dict) or not set(changes) <= {"places", "interests", "sources", "budgets", "prompts"}:
         raise ValueError("The app sent settings the server doesn't know.")
     if "places" in changes and "sources" in changes:
@@ -1554,7 +1585,7 @@ def save_settings(db, changes):
             found[name] = about
         new["interests"] = found
     # tag() matches the model's answers on letters and digits only, and no two tabs can have the same name. All is the
-    # app's first tab, None and Elsewhere the writer's answers for no place and one the reader doesn't follow, and
+    # app's first tab, None and Elsewhere the tagger's answers for no place and one the reader doesn't follow, and
     # Topics the feeds without one.
     tabs = ["All", "None", ELSEWHERE, "Topics"] + list(new.get("places", where)) + list(new.get("interests", before))
     taken = set()
@@ -1632,7 +1663,9 @@ def save_settings(db, changes):
         for table in ("articles", "stories"):
             db.execute(f"UPDATE {table} SET region = CASE region {case} END WHERE region IN ({','.join('?' * len(moves))})",
                        params + list(moves))
-    changed = "interests" in new and new["interests"] != before
+    changed = ("interests" in new and new["interests"] != before or "places" in new
+               and {name: place["about"] for name, place in new["places"].items()}
+               != {name: place["about"] for name, place in where.items()})
     if changed:
         db.execute("UPDATE stories SET interests = NULL WHERE updated >= ?", (iso(now() - SHOW),))
     db.commit()
@@ -1644,8 +1677,8 @@ TAGGING = threading.Lock()
 
 
 def retag():
-    """Sorts the recent stories into the changed interests in the background, so their tabs fill within minutes instead
-    of at the next processing run."""
+    """Sorts the recent stories into the changed interests and places in the background, so their tabs fill within
+    minutes instead of at the next processing run."""
     with TAGGING, closing(connect()) as db:
         tag(db)
 
