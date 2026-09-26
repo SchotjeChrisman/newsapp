@@ -1030,7 +1030,7 @@ fun InterestsScreen(places: List<Place>, interests: List<Interest>, onBack: () -
                 modifier = Modifier.fillMaxWidth(),
             )
             Hint(
-                if (current == null) "Stories written from now on can be filed here."
+                if (current == null) "After saving, the stories of the last two days are filed again, which takes a few minutes."
                 else "Renaming keeps its feeds and stories. Deleting moves its feeds to Topics.",
             )
         }
