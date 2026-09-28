@@ -637,18 +637,26 @@ def test_morning():
                                              (2, "NL", ["Football"], ["NOS", "AD"]),
                                              (3, "Zwolle", [], ["De Stentor", "1Zwolle"]),
                                              (4, "US", ["AI"], ["CNN", "Fox News", "NPR"]),
-                                             (5, "Global", [], [f"Outlet {i}" for i in range(12)]),
+                                             (5, "Global", ["AI"], [f"Outlet {i}" for i in range(12)]),
                                              (6, "Elsewhere", ["AI"], ["BBC", "DW"]),
                                              (7, "Elsewhere", [], [f"Outlet {i}" for i in range(30)]),
                                              (8, "NL", [], [f"Outlet {i}" for i in range(5)]),
-                                             (9, "NL", ["Football"], [f"Outlet {i}" for i in range(5)])):
+                                             (9, "NL", ["Football"], [f"Outlet {i}" for i in range(5)]),
+                                             (13, "US", ["AI"], ["The Verge", "Wired"])):
         db.execute("INSERT INTO stories(id, updated, n, headline, summary, region, interests) VALUES (?,?,?,?,?,?,?)",
                    (sid, t, len(outlets), f"Headline {sid}", f"Story number {sid} happened today. Then more.", region,
                     json.dumps(interests)))
         age = timedelta(hours=30 if sid == 5 else 1)
         for i, outlet in enumerate(outlets):
             add_article(db, sid * 100 + i, sid, outlet, f"Title {sid} {i}", age=age)
-    for sid, vec in ((1, [3, 0, 0]), (8, [2.7, 0.6, 0]), (9, [0.5, 3, 0]), (2, [0.6, 2.7, 0.3])):  # sums, not unit vectors
+    for sid, region, old, new in ((10, "NL", 8, 1), (11, "NL", 10, 5), (12, "Elsewhere", 40, 5)):
+        # most of their sources wrote before the report's 24 hours
+        db.execute("INSERT INTO stories(id, updated, n, headline, summary, region, interests) VALUES (?,?,?,?,?,?,'[]')",
+                   (sid, t, old + new, f"Headline {sid}", f"Story number {sid} happened today. Then more.", region))
+        for i in range(old + new):
+            add_article(db, sid * 100 + i, sid, f"Outlet {i}", f"Title {sid} {i}", age=timedelta(hours=30 if i < old else 2))
+    for sid, vec in ((1, [3, 0, 0]), (8, [2.7, 0.6, 0]), (9, [0.5, 3, 0]), (2, [0.6, 2.7, 0.3]), (4, [0, 0, 3]),
+                     (13, [0, 0.5, 2.9])):  # sums, not unit vectors
         db.execute("UPDATE stories SET vec = ? WHERE id = ?", (np.array(vec, np.float32).tobytes(), sid))
     news.morning(db, datetime(2026, 9, 23, 4, 50, tzinfo=UTC).astimezone() - timedelta(hours=2))
     assert db.execute("SELECT COUNT(*) FROM reports").fetchone() == (0,), "no report before REPORT_HOUR"
@@ -656,15 +664,26 @@ def test_morning():
     report = news.latest_report(db)
     assert report["day"] == "2026-09-23" and report["market"]["change"] == -0.5
     assert [(sec["title"], [st["id"] for st in sec["stories"]]) for sec in report["sections"]] == [
-        ("Zwolle", [3]), ("NL", [1, 9]), ("Elsewhere", [7]), ("AI", [4])], \
-        "major stories per region, then interests; old news, small stories, minor ones from elsewhere and a second story" \
-        " about an event already listed (8 of 1, 2 of 9) stay out"
+        ("Zwolle", [3]), ("NL", [1, 9, 11]), ("Elsewhere", [7]), ("AI", [4])], \
+        "major stories per region by their sources in the last 24 hours, then interests; old news, big stories with" \
+        " little new (10, 12), small stories, minor ones from elsewhere and a second story about an event already listed" \
+        " (8 of 1, 2 of 9, 13 of 4) stay out"
     assert report["sections"][1]["stories"][0] == {"id": 1, "headline": "Headline 1", "gist": "Story number 1 happened today.",
                                                   "sources": 6}, "without a writer the gist is the summary's first sentence"
     news.morning(db, fixed.astimezone())
     assert db.execute("SELECT COUNT(*) FROM reports").fetchone() == (1,), "one report a day"
     assert news.api(db)["report"] == report
     assert report["since"] == "2026-09-22T03:00:00+00:00", "the 24 hours before 05:00 local"
+
+    db.execute("DELETE FROM reports")
+    db.execute("INSERT INTO reports(day, body) VALUES ('2026-09-22', ?)", (json.dumps(
+        {"sections": [{"title": "NL", "stories": [{"id": 1}]}, {"title": "AI", "stories": [{"id": 4}]}]}),))
+    news.morning(db, fixed.astimezone())
+    listed = {sec["title"]: [st["id"] for st in sec["stories"]] for sec in news.latest_report(db)["sections"]}
+    assert listed["NL"][0] == 1 and "AI" not in listed, \
+        "a story an earlier report listed comes back only when its new sources alone make it major, and its double" \
+        " (13 of 4) doesn't take its place"
+    db.execute("DELETE FROM reports")
 
     news.market = lambda: None
     db.execute("DELETE FROM reports")

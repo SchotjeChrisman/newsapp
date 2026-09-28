@@ -1082,7 +1082,7 @@ def gists(db, stories):
 
 def morning(db, t=None):
     """Builds the day's morning report once the REPORT_HOUR run is done: the S&P 500's last close, the major stories of
-    the last 24 hours per region, and the top stories per interest."""
+    the last 24 hours per region, and the top stories per interest that no earlier report listed."""
     t = t or datetime.now().astimezone()
     end = datetime.combine(t.date(), clock(REPORT_HOUR)).astimezone()
     day = end.date().isoformat()
@@ -1099,20 +1099,31 @@ def morning(db, t=None):
         return
     # Local midnight arithmetic, so a night with a clock change still starts the window at REPORT_HOUR.
     since = iso(datetime.combine(end.date() - timedelta(days=1), clock(REPORT_HOUR)).astimezone())
-    stories = [s for s in shown(db) if s["headline"] and followed(s) and any(a[5] >= since for a in s["arts"])]
+    # A story counts with its sources since then, not over its whole life: a big story that gets one more article a day
+    # would otherwise come back every morning, above the day's own news.
+    stories = [s | {"today": source_count([(a[1], a[7]) for a in s["arts"] if a[5] >= since])}
+               for s in shown(db) if s["headline"] and followed(s)]
+    stories = sorted((s for s in stories if s["today"]), key=lambda s: (s["today"], s["arts"][-1][5]), reverse=True)
+    # The interests have no minimum, so any new article would bring a story an earlier report listed back, or a double
+    # of it that the grouping split off.
+    reported = {st["id"] for body, in db.execute("SELECT body FROM reports WHERE day < ?", (day,))
+                for section in json.loads(body)["sections"] for st in section["stories"]}
+    before = [w / np.linalg.norm(w) for w in (np.frombuffer(blob, np.float32) for blob, in db.execute(
+        "SELECT vec FROM stories WHERE vec IS NOT NULL AND id IN (SELECT value FROM json_each(?))",
+        (json.dumps(sorted(reported)),)))]
     vecs = {sid: np.frombuffer(blob, np.float32) for sid, blob in db.execute(
         "SELECT id, vec FROM stories WHERE vec IS NOT NULL AND updated >= ?", (since,))}
     sections, picked, seen = [], set(), []
 
-    def take(candidates, most):
-        """The first stories not in the report yet, skipping doubles of the ones it lists."""
+    def take(candidates, most, avoid=()):
+        """The first stories not in the report yet, skipping doubles of the ones it lists and of those to avoid."""
         chosen = []
         for s in candidates:
             if len(chosen) == most:
                 break
             v = vecs.get(s["id"])
             v = v / np.linalg.norm(v) if v is not None else None
-            if s["id"] in picked or v is not None and any(v @ w >= DOUBLE for w in seen):
+            if s["id"] in picked or v is not None and any(v @ w >= DOUBLE for w in [*seen, *avoid]):
                 continue
             chosen.append(s)
             picked.add(s["id"])
@@ -1121,12 +1132,13 @@ def morning(db, t=None):
         return chosen
 
     for region, place in places(db).items():
-        sections.append((region, take([s for s in stories if region in s["regions"] and s["sources"] >= place["major"]],
+        sections.append((region, take([s for s in stories if region in s["regions"] and s["today"] >= place["major"]],
                                       REPORT_PER_REGION)))
-    sections.append((ELSEWHERE, take([s for s in stories if s["regions"] == [ELSEWHERE] and s["sources"] >= ELSEWHERE_SOURCES],
+    sections.append((ELSEWHERE, take([s for s in stories if s["regions"] == [ELSEWHERE] and s["today"] >= ELSEWHERE_SOURCES],
                                      REPORT_PER_REGION)))
     for interest in interests(db):
-        sections.append((interest, take([s for s in stories if interest in s["interests"]], REPORT_PER_INTEREST)))
+        sections.append((interest, take([s for s in stories if interest in s["interests"] and s["id"] not in reported],
+                                        REPORT_PER_INTEREST, before)))
     listed = [s for _, section in sections for s in section]
     gist = gists(db, listed)
     body = {"day": day, "built": iso(now()), "since": since, "market": market(),
