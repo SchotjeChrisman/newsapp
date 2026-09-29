@@ -318,10 +318,14 @@ def x_posts(handle):
     async def read():
         api = twscrape.API(str(X_ACCOUNTS), raise_when_no_account=True)
         await api.pool.add_account_cookies("news", cookies)  # also retries a login twscrape gave up on
+        # twscrape answers None or nothing, not an error, when X blocks a request or no longer knows it
         user = await api.user_by_login(handle)
         if user is None:
-            raise LookupError(f"X has no account @{handle}")
-        return user, [t async for t in api.user_tweets(user.id, limit=20)]
+            raise LookupError(f"X didn't answer or has no account @{handle}")
+        tweets = [t async for t in api.user_tweets(user.id, limit=20)]
+        if not tweets:
+            raise LookupError(f"X sent no posts of @{handle}")
+        return user, tweets
 
     with X_LOCK:
         try:
@@ -332,12 +336,13 @@ def x_posts(handle):
     bare = lambda t: re.sub(r"\s*https://t\.co/\w+", "", html.unescape(t.rawContent)).strip()
     items = []
     for t in tweets:
-        if t.user.id != user.id or t.retweetedTweet or (t.inReplyToUser and t.inReplyToUser.id != user.id):
-            continue
-        if not (own := bare(t)):
+        if t.user.id != user.id or t.retweetedTweet or (
+                t.inReplyToTweetId and (t.inReplyToUser is None or t.inReplyToUser.id != user.id)):
             continue
         quoted = f"\n\nQuoting @{t.quotedTweet.user.username}: {bare(t.quotedTweet)}" if t.quotedTweet else ""
-        items.append(dict(url=t.url, title=textwrap.shorten(own, 120, placeholder=" …"), summary=(own + quoted)[:PAGE_MAX],
+        if not re.search(r"\w", text := bare(t) + quoted):  # a link, a photo or emoji alone say nothing to write about
+            continue
+        items.append(dict(url=t.url, title=textwrap.shorten(text, 120, placeholder=" …"), summary=text[:PAGE_MAX],
                           published=t.date, outlet=None))
     return items
 
@@ -417,9 +422,10 @@ def collect(db):
             outlet = names.get(outlet_key(outlet), outlet)
             if outlet not in listed and any(fnmatch.fnmatch(outlet.lower(), pattern.lower()) for pattern in ignore):
                 continue
-            # The same headline from the same outlet reached us twice, e.g. directly and through Google News.
-            if db.execute("SELECT 1 FROM articles WHERE outlet = ? AND title = ? AND published >= ?",
-                          (outlet, a["title"], iso(t - OPEN_FOR))).fetchone():
+            # The same headline from the same outlet reached us twice, e.g. directly and through Google News. A post on X
+            # doesn't count: an account posts the same words again, and its site's headline before the article is out.
+            if db.execute("SELECT 1 FROM articles WHERE outlet = ? AND title = ? AND published >= ?"
+                          " AND url NOT LIKE 'https://x.com/%'", (outlet, a["title"], iso(t - OPEN_FOR))).fetchone():
                 continue
             opinion = (s.get("opinion", False) or bool(OPINION.search(urlsplit(a["url"]).path))
                        or bool(OPINION_TITLE.search(a["title"])))

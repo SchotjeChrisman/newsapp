@@ -4,6 +4,7 @@ import os
 
 os.environ["NEWS_DB"] = ":memory:"
 
+import asyncio
 import base64
 import gzip
 import io
@@ -1003,17 +1004,21 @@ def test_x_posts():
 
     def post(n, text, user=pec, **kw):
         return SimpleNamespace(**{"url": f"https://x.com/{user.username}/status/{n}", "rawContent": text, "user": user,
-                                  "date": t, "retweetedTweet": None, "inReplyToUser": None, "quotedTweet": None} | kw)
+                                  "date": t, "retweetedTweet": None, "inReplyToTweetId": None, "inReplyToUser": None,
+                                  "quotedTweet": None} | kw)
 
     long = "Selectie bekend voor het bekerduel tegen TOP Oss. " * 25
     tweets = [post(1, "Twee debuten in één week 🐺\n\nNa zijn debuut maakte Gilles zijn debuut voor Oranje O19. https://t.co/Z8mcoXZB1a"),
               post(2, "Mooi &amp; terecht! https://t.co/abc", quotedTweet=post(9, "Mijn eerste goal https://t.co/x", user=fan)),
               post(3, "RT @fan: Mijn eerste goal", retweetedTweet=post(9, "Mijn eerste goal", user=fan)),
-              post(4, "@fan Dank je!", inReplyToUser=fan),
-              post(5, long, inReplyToUser=pec),
+              post(4, "@fan Dank je!", inReplyToTweetId=40, inReplyToUser=fan),
+              post(5, long, inReplyToTweetId=41, inReplyToUser=pec),
               post(6, "https://t.co/onlyaphoto"),
-              post(7, "Gesponsord bericht", user=fan)]
-    logins, failure = [], None
+              post(7, "Gesponsord bericht", user=fan),
+              post(8, "@weg Graag gedaan", inReplyToTweetId=42),  # a reply to an account X no longer shows
+              post(10, "🐺🐺🐺 https://t.co/foto"),
+              post(11, "💙", quotedTweet=post(12, "Ik teken bij PEC Zwolle!", user=fan))]
+    logins, failure, reading = [], None, []
 
     class API:
         def __init__(self, path, raise_when_no_account):
@@ -1029,6 +1034,10 @@ def test_x_posts():
         async def user_tweets(self, uid, limit):
             if failure:
                 raise failure
+            reading.append(uid)
+            assert len(reading) == 1, "one X read at a time"
+            await asyncio.sleep(0.05)
+            reading.pop()
             for tweet in tweets:
                 yield tweet
 
@@ -1038,13 +1047,27 @@ def test_x_posts():
     items, error = FETCH({"url": "https://x.com/PECZwolle/"})
     assert error is None and logins == ["auth_token=a; ct0=b"]
     assert [a["url"] for a in items] == ["https://x.com/PECZwolle/status/1", "https://x.com/PECZwolle/status/2",
-                                         "https://x.com/PECZwolle/status/5"], "own posts, its quotes and its threads"
+                                         "https://x.com/PECZwolle/status/5", "https://x.com/PECZwolle/status/11"], \
+        "own posts, its quotes and its threads"
     assert items[0]["title"] == "Twee debuten in één week 🐺 Na zijn debuut maakte Gilles zijn debuut voor Oranje O19."
     assert items[0]["summary"] == "Twee debuten in één week 🐺\n\nNa zijn debuut maakte Gilles zijn debuut voor Oranje O19."
     assert items[0]["published"] == t and items[0]["outlet"] is None
     assert items[1]["summary"] == "Mooi & terecht!\n\nQuoting @fan: Mijn eerste goal", "a quote carries what it quotes"
     assert len(items[2]["title"]) <= 120 and items[2]["title"].endswith(" …") and items[2]["summary"] == long.strip(), "a long post is kept whole"
-    assert FETCH({"url": "https://Mobile.Twitter.com/nobody"}) == ([], "LookupError: X has no account @nobody")
+    assert items[3]["title"] == "💙 Quoting @fan: Ik teken bij PEC Zwolle!", "a quote's title says what it quotes"
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(FETCH({"url": "https://x.com/PECZwolle"})[1]))
+               for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert results == [None, None], results
+    assert FETCH({"url": "https://Mobile.Twitter.com/nobody"}) == (
+        [], "LookupError: X didn't answer or has no account @nobody")
+    tweets = []
+    assert FETCH({"url": "https://x.com/PECZwolle"}) == ([], "LookupError: X sent no posts of @PECZwolle"), \
+        "an account always has posts, so none means X didn't answer"
     failure = news.twscrape.NoAccountError("No account available for queue UserTweets")
     assert FETCH({"url": "https://x.com/PECZwolle"}) == (
         [], "RuntimeError: X didn't answer, refused the login or limits it; renew the x_cookies secret if this lasts")
@@ -1058,6 +1081,21 @@ def test_x_posts():
     news.read_pages(None, "model", [story])
     news.ask = ask
     assert [a["outlet"] for a in asked[0]["stories"][0]["articles"]] == ["RTV Oost"], "an X post isn't offered to read"
+
+    item = lambda url, title: dict(url=url, title=title, summary="", published=t, outlet=None)
+    feeds = {"https://x.com/PECZwolle": ([item("https://x.com/PECZwolle/status/1", "GOAL! 🐺"),
+                                          item("https://x.com/PECZwolle/status/2", "GOAL! 🐺"),
+                                          item("https://x.com/PECZwolle/status/3", "Selectie bekend")], None),
+             "https://peczwolle.nl/rss": ([item("https://peczwolle.nl/selectie", "Selectie bekend")], None)}
+    fetch, news.fetch = news.fetch, lambda source: feeds[source["url"]]
+    with tempfile.TemporaryDirectory() as tmp:
+        news.SOURCES = Path(tmp, "sources.toml")
+        news.SOURCES.write_text('Zwolle = [{ name = "PEC Zwolle", url = "https://x.com/PECZwolle" },'
+                                ' { name = "PEC Zwolle", url = "https://peczwolle.nl/rss" }]\n')
+        db = news.connect()
+        news.collect(db)
+    news.SOURCES, news.fetch = SOURCES, fetch
+    assert db.execute("SELECT count(*) FROM articles").fetchone()[0] == 4, "posts are told apart by address, not headline"
 
 
 test_parse()
