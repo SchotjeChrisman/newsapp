@@ -17,6 +17,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -24,6 +25,7 @@ import news
 
 UTC = timezone.utc
 SOURCES = news.SOURCES
+FETCH = news.fetch  # test_collect replaces it
 
 RSS = b"""<?xml version="1.0"?>
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel>
@@ -995,6 +997,69 @@ def test_http():
     server.shutdown()
 
 
+def test_x_posts():
+    t = news.now()
+    pec, fan = SimpleNamespace(id=1, username="PECZwolle"), SimpleNamespace(id=2, username="fan")
+
+    def post(n, text, user=pec, **kw):
+        return SimpleNamespace(**{"url": f"https://x.com/{user.username}/status/{n}", "rawContent": text, "user": user,
+                                  "date": t, "retweetedTweet": None, "inReplyToUser": None, "quotedTweet": None} | kw)
+
+    long = "Selectie bekend voor het bekerduel tegen TOP Oss. " * 25
+    tweets = [post(1, "Twee debuten in één week 🐺\n\nNa zijn debuut maakte Gilles zijn debuut voor Oranje O19. https://t.co/Z8mcoXZB1a"),
+              post(2, "Mooi &amp; terecht! https://t.co/abc", quotedTweet=post(9, "Mijn eerste goal https://t.co/x", user=fan)),
+              post(3, "RT @fan: Mijn eerste goal", retweetedTweet=post(9, "Mijn eerste goal", user=fan)),
+              post(4, "@fan Dank je!", inReplyToUser=fan),
+              post(5, long, inReplyToUser=pec),
+              post(6, "https://t.co/onlyaphoto"),
+              post(7, "Gesponsord bericht", user=fan)]
+    logins, failure = [], None
+
+    class API:
+        def __init__(self, path, raise_when_no_account):
+            assert raise_when_no_account, "an unavailable login must fail the fetch, not wait for it"
+            self.pool = self
+
+        async def add_account_cookies(self, name, cookies):
+            logins.append(cookies)
+
+        async def user_by_login(self, handle):
+            return pec if handle == "PECZwolle" else None
+
+        async def user_tweets(self, uid, limit):
+            if failure:
+                raise failure
+            for tweet in tweets:
+                yield tweet
+
+    real, news.twscrape = news.twscrape, SimpleNamespace(API=API, NoAccountError=news.twscrape.NoAccountError)
+    assert FETCH({"url": "https://x.com/PECZwolle"}) == ([], "RuntimeError: no X login: create the x_cookies secret")
+    os.environ["X_COOKIES"] = "auth_token=a; ct0=b"
+    items, error = FETCH({"url": "https://x.com/PECZwolle/"})
+    assert error is None and logins == ["auth_token=a; ct0=b"]
+    assert [a["url"] for a in items] == ["https://x.com/PECZwolle/status/1", "https://x.com/PECZwolle/status/2",
+                                         "https://x.com/PECZwolle/status/5"], "own posts, its quotes and its threads"
+    assert items[0]["title"] == "Twee debuten in één week 🐺 Na zijn debuut maakte Gilles zijn debuut voor Oranje O19."
+    assert items[0]["summary"] == "Twee debuten in één week 🐺\n\nNa zijn debuut maakte Gilles zijn debuut voor Oranje O19."
+    assert items[0]["published"] == t and items[0]["outlet"] is None
+    assert items[1]["summary"] == "Mooi & terecht!\n\nQuoting @fan: Mijn eerste goal", "a quote carries what it quotes"
+    assert len(items[2]["title"]) <= 120 and items[2]["title"].endswith(" …") and items[2]["summary"] == long.strip(), "a long post is kept whole"
+    assert FETCH({"url": "https://Mobile.Twitter.com/nobody"}) == ([], "LookupError: X has no account @nobody")
+    failure = news.twscrape.NoAccountError("No account available for queue UserTweets")
+    assert FETCH({"url": "https://x.com/PECZwolle"}) == (
+        [], "RuntimeError: X didn't answer, refused the login or limits it; renew the x_cookies secret if this lasts")
+    del os.environ["X_COOKIES"]
+    news.twscrape = real
+
+    asked, ask = [], news.ask
+    news.ask = lambda db, model, kind, payload, tokens: asked.append(payload) or {"stories": []}
+    story = {"articles": [{"url": "https://x.com/PECZwolle/status/1", "outlet": "PEC Zwolle", "title": "Post", "text": "Post"},
+                          {"url": "https://rtvoost.nl/1", "outlet": "RTV Oost", "title": "Debuut", "text": "Debuut"}]}
+    news.read_pages(None, "model", [story])
+    news.ask = ask
+    assert [a["outlet"] for a in asked[0]["stories"][0]["articles"]] == ["RTV Oost"], "an X post isn't offered to read"
+
+
 test_parse()
 test_outlet_key()
 test_sources()
@@ -1006,6 +1071,7 @@ test_translate_before_grouping()
 test_language_backfill()
 test_mistral_articles()
 test_fetch_page()
+test_x_posts()
 test_write()
 test_claude_writer()
 test_tag()

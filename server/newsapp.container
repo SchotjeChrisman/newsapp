@@ -1,5 +1,6 @@
 # Rootless Podman service. On the server, once:
 #   printf '%s' 'TOKEN_FROM_claude_setup-token' | podman secret create claude_oauth_token -
+#   printf '%s' 'auth_token=...; ct0=...' | podman secret create x_cookies -   # to read X accounts: a browser's X cookies
 #   cp newsapp.container ~/.config/containers/systemd/
 #   loginctl enable-linger                                   # start at boot, keep running after logout
 #   systemctl --user enable --now podman-auto-update.timer   # pull new images daily
@@ -11,6 +12,8 @@ Description=Private news server
 Image=ghcr.io/schotjechrisman/newsapp:latest
 AutoUpdate=registry
 Secret=claude_oauth_token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN
+# Once the x_cookies secret exists; without it podman won't start the container.
+# Secret=x_cookies,type=env,target=X_COOKIES
 Volume=newsapp-data:/data
 PublishPort=8080:8080
 # Environment=NEWS_THRESHOLD=0.6
