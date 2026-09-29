@@ -1,6 +1,7 @@
-"""Private news server: collects feeds, groups articles about the same event into stories,
+"""Private news server: collects feeds and X accounts, groups articles about the same event into stories,
 has Mistral write them up, and serves a check page."""
 
+import asyncio
 import email.utils
 import fnmatch
 import gzip
@@ -13,6 +14,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import tomllib
@@ -30,6 +32,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 import numpy as np
 import trafilatura
+import twscrape
 
 DB = os.environ.get("NEWS_DB", "/data/news.db")
 SOURCES = Path(__file__).with_name("sources.toml")
@@ -74,6 +77,9 @@ PAGE_MAX = 12000
 PAGES_PER_STORY = 3
 PAGES_WITHIN = 600  # seconds for all article pages of a run together
 EXTRACTING = threading.Lock()  # trafilatura isn't thread-safe: extracting in parallel threads crashed the process
+X_HOSTS = {"x.com", "www.x.com", "mobile.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
+X_ACCOUNTS = Path(DB).with_name("x_accounts.db")  # twscrape keeps the X login's session and rate limits here
+X_LOCK = threading.Lock()  # one X login: two accounts read at once would find it busy
 OPINION = re.compile(r"/(columns?-opinie|opinie|opinions?|columns?|commentisfree|commentary)/", re.I)
 # Google News links hide the section, so its opinion pieces are recognized by the label in the headline.
 OPINION_TITLE = re.compile(r"^(opinion|opinie|column)\s*[|:]|\|\s*(opinion|opinie|column)\s*$", re.I)
@@ -284,8 +290,11 @@ def parse_feed(data):
 
 
 def fetch(source):
-    req = urllib.request.Request(source["url"], headers={"User-Agent": UA})
     try:
+        url = urlsplit(source["url"])
+        if url.hostname in X_HOSTS:
+            return x_posts(url.path.strip("/").split("/")[0]), None
+        req = urllib.request.Request(source["url"], headers={"User-Agent": UA})
         with urllib.request.urlopen(req, timeout=20) as r:
             data, deadline = b"", time.monotonic() + 60
             while len(data) < 5_000_000 and (chunk := r.read1(65536)):
@@ -297,6 +306,45 @@ def fetch(source):
         return parse_feed(data), None
     except Exception as e:
         return [], f"{type(e).__name__}: {e}"
+
+
+def x_posts(handle):
+    """An X account's own posts and its quotes of others, as feed items; replies and reposts are left out. X is read
+    through the login in the x_cookies secret: the auth_token and ct0 cookies of a browser logged in to X."""
+    cookies = os.environ.get("X_COOKIES")
+    if not cookies:
+        raise RuntimeError("no X login: create the x_cookies secret")
+
+    async def read():
+        api = twscrape.API(str(X_ACCOUNTS), raise_when_no_account=True)
+        await api.pool.add_account_cookies("news", cookies)  # also retries a login twscrape gave up on
+        # twscrape answers None or nothing, not an error, when X blocks a request or no longer knows it
+        user = await api.user_by_login(handle)
+        if user is None:
+            raise LookupError(f"X didn't answer or has no account @{handle}")
+        tweets = [t async for t in api.user_tweets(user.id, limit=20)]
+        if not tweets:
+            raise LookupError(f"X sent no posts of @{handle}")
+        return user, tweets
+
+    with X_LOCK:
+        try:
+            user, tweets = asyncio.run(read())
+        except twscrape.NoAccountError:
+            raise RuntimeError("X didn't answer, refused the login or limits it; renew the x_cookies secret if this lasts") from None
+    # X sends a post's text HTML-escaped, with short links that mean nothing without the page
+    bare = lambda t: re.sub(r"\s*https://t\.co/\w+", "", html.unescape(t.rawContent)).strip()
+    items = []
+    for t in tweets:
+        if t.user.id != user.id or t.retweetedTweet or (
+                t.inReplyToTweetId and (t.inReplyToUser is None or t.inReplyToUser.id != user.id)):
+            continue
+        quoted = f"\n\nQuoting @{t.quotedTweet.user.username}: {bare(t.quotedTweet)}" if t.quotedTweet else ""
+        if not re.search(r"\w", text := bare(t) + quoted):  # a link, a photo or emoji alone say nothing to write about
+            continue
+        items.append(dict(url=t.url, title=textwrap.shorten(text, 120, placeholder=" …"), summary=text[:PAGE_MAX],
+                          published=t.date, outlet=None))
+    return items
 
 
 def google_news_target(url):
@@ -374,9 +422,10 @@ def collect(db):
             outlet = names.get(outlet_key(outlet), outlet)
             if outlet not in listed and any(fnmatch.fnmatch(outlet.lower(), pattern.lower()) for pattern in ignore):
                 continue
-            # The same headline from the same outlet reached us twice, e.g. directly and through Google News.
-            if db.execute("SELECT 1 FROM articles WHERE outlet = ? AND title = ? AND published >= ?",
-                          (outlet, a["title"], iso(t - OPEN_FOR))).fetchone():
+            # The same headline from the same outlet reached us twice, e.g. directly and through Google News. A post on X
+            # doesn't count: an account posts the same words again, and its site's headline before the article is out.
+            if db.execute("SELECT 1 FROM articles WHERE outlet = ? AND title = ? AND published >= ?"
+                          " AND url NOT LIKE 'https://x.com/%'", (outlet, a["title"], iso(t - OPEN_FOR))).fetchone():
                 continue
             opinion = (s.get("opinion", False) or bool(OPINION.search(urlsplit(a["url"]).path))
                        or bool(OPINION_TITLE.search(a["title"])))
@@ -817,6 +866,8 @@ def read_pages(db, model, stories):
         for i, st in enumerate(batch, 1):
             items = []
             for a in st["articles"]:
+                if urlsplit(a["url"]).netloc in X_HOSTS:  # a post is whole already, and X's page shows other posts too
+                    continue
                 n += 1
                 keyed[f"a{n}"] = (i, a)
                 items.append({"key": f"a{n}", "outlet": a["outlet"], "title": a["title"], "text": a["text"][:300]})

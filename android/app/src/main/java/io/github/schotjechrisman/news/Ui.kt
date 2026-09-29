@@ -1137,6 +1137,7 @@ private fun SourceDialog(settings: Settings, source: Source?, region: String?, o
         OutlinedTextField(
             url, { url = it },
             label = { Text("Feed address") },
+            supportingText = { Text("An RSS or Atom feed, or an X account as https://x.com/name") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
             modifier = Modifier.fillMaxWidth(),
