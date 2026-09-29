@@ -192,6 +192,55 @@ def test_group():
     assert "<script>alert(1)" not in page and "&lt;script&gt;alert(1)" in page
 
 
+def test_same_news():
+    # y1 and v1 come close to x1 (0.55, 0.52) and w1 to y1 (0.58), none close enough to join; z1 is near nothing.
+    directions = {"x1": [1, 0, 0], "y1": [0.55, 0.835, 0], "w1": [0, 0.7, 0.714], "v1": [0.52, -0.854, 0],
+                  "z1": [0, 0, -1], "u1": [0.8, 0, 0.6]}
+    news.embed = lambda texts: np.array([directions[t.split()[0]] for t in texts], np.float32)
+    db = news.connect()
+    t0 = news.now() - timedelta(hours=10)
+
+    def add(key, hours):
+        db.execute("INSERT INTO articles(url, outlet, region, title, summary, published, opinion) VALUES (?,?,?,?,?,?,0)",
+                   (f"https://x.nl/{key}", "NOS", "NL", f"{key} news", "", news.iso(t0 + timedelta(hours=hours))))
+
+    def story(key):
+        return db.execute("SELECT story FROM articles WHERE url = ?", (f"https://x.nl/{key}",)).fetchone()[0]
+
+    add("x1", 0)
+    news.group(db)
+    for hours, key in enumerate(["y1", "w1", "v1", "z1"], 1):
+        add(key, hours)
+    asked = []
+
+    def claude(model, system, payload, schema, effort):
+        assert schema == news.SCHEMAS["same"] and effort == news.TAG_EFFORT and news.FORMATS["same"] in system
+        asked.append(payload)
+        return json.dumps({"items": [{"key": "n1", "same": "n1e1", "event": "x"}, {"key": "n2", "same": "n2e1", "event": "x"},
+                                     {"key": "n3", "same": "none", "event": ""}]}), 0.01
+
+    original, news.call_claude = news.call_claude, claude
+    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "test"
+    news.group(db)
+    assert asked == [{"items": [
+        {"key": "n1", "articles": ["y1 news"], "earlier": [{"key": "n1e1", "articles": ["x1 news"]}]},
+        {"key": "n2", "articles": ["w1 news"], "earlier": [{"key": "n2e1", "articles": ["y1 news"]}]},
+        {"key": "n3", "articles": ["v1 news"], "earlier": [{"key": "n3e1", "articles": ["x1 news"]}]}]}], \
+        "only new stories close to an earlier open one are asked about"
+    assert story("y1") == story("x1"), "a new story joins the earlier one Claude calls the same news"
+    assert story("w1") == story("x1"), "and one joining that new story ends up in the same place"
+    assert story("v1") != story("x1") and story("z1") not in (story("x1"), story("v1"))
+    assert db.execute("SELECT COUNT(*) FROM stories").fetchone() == (3,), "no rows for the stories that joined"
+    assert db.execute("SELECT n FROM stories WHERE id = ?", (story("x1"),)).fetchone() == (3,)
+    assert db.execute("SELECT claude_usd FROM spend").fetchone() == (0.01,)
+
+    del os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+    add("u1", 5)
+    news.group(db)
+    assert len(asked) == 1 and story("u1") != story("x1"), "without Claude, grouping works as before"
+    news.call_claude = original
+
+
 def add_article(db, aid, story, outlet, title, opinion=0, lang="en", summary="", age=timedelta(hours=1)):
     db.execute("INSERT INTO articles(id, url, outlet, region, title, summary, published, opinion, lang, story)"
                " VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -1105,6 +1154,7 @@ test_source_count()
 test_collect()
 test_collect_deadline()
 test_group()
+test_same_news()
 test_translate_before_grouping()
 test_language_backfill()
 test_mistral_articles()
