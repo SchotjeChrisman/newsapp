@@ -38,6 +38,10 @@ DB = os.environ.get("NEWS_DB", "/data/news.db")
 SOURCES = Path(__file__).with_name("sources.toml")
 # Mean cosine similarity between an article and a story's articles needed to join it.
 THRESHOLD = float(os.environ.get("NEWS_THRESHOLD", "0.6"))
+# The similarity can't tell the same news from similar news: in the stories of 26-29 September, pairs about one event
+# scored 0.50-0.68 and pairs about different events 0.53-0.67 (Firefox 157's release and 158's beta: 0.54). So Claude
+# checks each new story that comes this close to an open one, and it joins that story when both report the same event.
+SAME_FLOOR = 0.5
 MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 COLLECT_EVERY = 30 * 60
 COLLECT_WITHIN = 120  # seconds for all feeds together
@@ -128,7 +132,8 @@ DAILY_BUDGET = 0.60
 CLAUDE_WRITER = "claude-sonnet-5"
 CLAUDE_EFFORT = "low"
 # Sorting the same 100 stories into interests twice changed 16 stories' interests at low effort and 7 at medium, which
-# costs about twice as much: a few cents per 100 stories.
+# costs about twice as much: a few cents per 100 stories. The same-news check uses it too: at low effort it combined
+# more different news.
 TAG_EFFORT = "medium"
 CLAUDE_DAILY_BUDGET = 50.00
 
@@ -480,7 +485,7 @@ def group(db):
     old = db.execute("SELECT id, updated, n, vec FROM stories WHERE updated >= ? AND vec IS NOT NULL",
                      (iso(datetime.fromisoformat(new[0][1]) - OPEN_FOR),)).fetchall()
     size, dim = len(old) + len(new), len(np.frombuffer(new[0][2], np.float32))
-    sums, counts, latest = np.zeros((size, dim), np.float32), np.zeros(size), np.zeros(size)
+    sums, counts, latest, start = np.zeros((size, dim), np.float32), np.zeros(size), np.zeros(size), np.zeros(size)
     ids = [r[0] for r in old]
     for j, r in enumerate(old):
         sums[j], counts[j] = np.frombuffer(r[3], np.float32), r[2]
@@ -495,11 +500,23 @@ def group(db):
         if j < 0 or sims[j] < THRESHOLD:
             j, k = k, k + 1
             ids.append(None)
+            start[j] = ts
         sums[j] += v
         latest[j] = max(latest[j], ts)
         counts[j] += 1
         changed.add(j)
         assigned.append((j, article))
+    members = defaultdict(list)
+    for j, article in assigned:
+        members[j].append(article)
+    into = same_news(db, ids, sums, counts, latest, start, members)
+    for f, j in into.items():
+        sums[j] += sums[f]
+        counts[j] += counts[f]
+        latest[j] = max(latest[j], latest[f])
+        changed.discard(f)
+        changed.add(j)
+    assigned = [(into.get(j, j), article) for j, article in assigned]
     for j in changed:
         row = (iso(datetime.fromtimestamp(latest[j], timezone.utc)), int(counts[j]), sums[j].tobytes())
         if ids[j] is None:
@@ -508,7 +525,54 @@ def group(db):
             db.execute("UPDATE stories SET updated = ?, n = ?, vec = ? WHERE id = ?", (*row, ids[j]))
     db.executemany("UPDATE articles SET story = ? WHERE id = ?", [(ids[j], a) for j, a in assigned])
     db.commit()
-    print(f"group: {len(todo)} embedded, {len(new)} assigned, {k - len(old)} new stories", flush=True)
+    print(f"group: {len(todo)} embedded, {len(new)} assigned, {k - len(old) - len(into)} new stories", flush=True)
+
+
+def same_news(db, ids, sums, counts, latest, start, members):
+    """Claude checks each story group() just started that came within SAME_FLOOR of an earlier open story, and says
+    which of those, if any, reports the same event. Returns {new story: story it joins}, as indexes into group()'s arrays."""
+    if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return {}
+    near = []
+    for f in (j for j, sid in enumerate(ids) if sid is None):
+        # Only stories started before it, so a pair is asked once and a chain of joins ends at the oldest story.
+        sims = sums[:f] @ sums[f] / (counts[:f] * counts[f])
+        close = np.flatnonzero((sims >= SAME_FLOOR) & (latest[:f] >= start[f] - OPEN_FOR.total_seconds()))
+        if len(close):
+            near.append((f, [int(i) for i in close[np.argsort(-sims[close])][:3]]))
+
+    def shown(j):
+        if ids[j] is None:
+            first = members[j][:3]
+            rows = db.execute("SELECT COALESCE(title_en, title), COALESCE(summary_en, summary) FROM articles"
+                              f" WHERE id IN ({','.join('?' * len(first))}) ORDER BY published", first)
+        else:
+            rows = db.execute("SELECT COALESCE(title_en, title), COALESCE(summary_en, summary) FROM articles"
+                              " WHERE story = ? ORDER BY published LIMIT 3", (ids[j],))
+        return [f"{title} — {text[:200]}" if text else title for title, text in rows]
+
+    into = {}
+    for b in range(0, len(near), 100):
+        batch = near[b:b + 100]
+        payload = {"items": [{"key": f"n{n}", "articles": shown(f),
+                              "earlier": [{"key": f"n{n}e{e}", "articles": shown(i)} for e, i in enumerate(close, 1)]}
+                             for n, (f, close) in enumerate(batch, 1)]}
+        try:
+            result = ask(db, CLAUDE_WRITER, "same", payload, 4000)
+        except (ClaudeUnavailable, ClaudeFailed, ValueError) as e:  # the rest stay separate stories, as before
+            print(f"group: same-news check stopped ({type(e).__name__}: {e})", flush=True)
+            break
+        items = result.get("items") if isinstance(result, dict) else None
+        answers = {}
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and isinstance(item.get("key"), str) and isinstance(item.get("same"), str):
+                answers[item["key"]] = item["same"]
+        for n, (f, close) in enumerate(batch, 1):
+            j = {f"n{n}e{e}": i for e, i in enumerate(close, 1)}.get(answers.get(f"n{n}"))
+            if j is not None:
+                into[f] = into.get(j, j)
+    print(f"group: {len(near)} new stories checked for the same news, {len(into)} joined an earlier one", flush=True)
+    return into
 
 
 def regroup(db):
@@ -603,7 +667,7 @@ def ask(db, model, kind, payload, max_tokens):
         if claude_usd >= caps["claude"]:
             raise ClaudeUnavailable(f"daily Claude budget of ${caps['claude']:.2f} (API-equivalent) reached")
         content, cost = call_claude(model, system, payload, reply_schema(db, kind),
-                                    TAG_EFFORT if kind == "tag" else CLAUDE_EFFORT)
+                                    TAG_EFFORT if kind in ("tag", "same") else CLAUDE_EFFORT)
         db.execute("INSERT OR IGNORE INTO spend(day) VALUES (?)", (day,))
         db.execute("UPDATE spend SET claude_usd = COALESCE(claude_usd, 0) + ? WHERE day = ?", (cost, day))
     else:
@@ -644,6 +708,14 @@ def translate(db):
         db.commit()
     print(f"translate: {len(todo)} Dutch articles", flush=True)
 
+
+SAME_PROMPT = """Two stories are the same news when they report the same event: the same release, announcement, decision, match,
+accident, crime or deal, told by different outlets or at different moments.
+Stories that only share a subject, person, company, place or product are different news. For example: Firefox 157's
+release and Firefox 158's beta; two days of stock market reports; a court halting a project and a government preferring
+another one; a report on falls among older people and advice on falling safely; two fundraisers for one candidate.
+Each item has a new story and earlier stories. Answer with the key of the earlier story that reports the same event as
+the new story, and name that event in a few words; or answer "none" with an empty event. When unsure, answer "none"."""
 
 RULES = """Rules:
 - Write English only, in plain neutral language: no loaded or emotive words, no speculation.
@@ -726,10 +798,12 @@ repeat it. Refer to stories by their key exactly as given ("s1")."""
 
 # The prompts by kind, with their name and what the app says about them. The app can replace each text; the code adds
 # the writing rules, the interests and the reply format, which it depends on and so can't be changed.
-PROMPTS = {"translate": TRANSLATE_PROMPT, "rules": RULES, "places": PLACE_PROMPT, "read": READ_PROMPT, "new": NEW_PROMPT,
+PROMPTS = {"translate": TRANSLATE_PROMPT, "same": SAME_PROMPT, "rules": RULES, "places": PLACE_PROMPT, "read": READ_PROMPT, "new": NEW_PROMPT,
            "update": UPDATE_PROMPT, "tag": TAG_PROMPT, "report": REPORT_PROMPT}
 PROMPT_NOTES = {
     "translate": ("Translation", "Turns Dutch headlines and teasers into English. The reply format is added after it."),
+    "same": ("Same news", "Decides whether a new story that nearly matched an earlier one reports the same event; then its "
+                          "articles join that story. The reply format is added after it."),
     "rules": ("Writing rules", "Added to the prompts for new stories and for updates."),
     "places": ("Places", "How stories are filed under a place. Added to the interests prompt, with the places after it."),
     "read": ("Reading", "Picks from headlines and teasers the articles whose full page is read before a story is "
@@ -744,6 +818,7 @@ PROMPT_NOTES = {
 }
 FORMATS = {
     "translate": 'Return JSON: {"items": [{"id": <id>, "title": "<English title>", "text": "<English text>"}]}',
+    "same": 'Return JSON: {"items": [{"key": "n1", "same": "none", "event": ""}, {"key": "n2", "same": "n2e1", "event": "..."}]}',
     "read": 'Return JSON: {"stories": [{"key": "s1", "articles": ["a1", "a3"]}]}',
     "new": """Return JSON: {"stories": [{"key": "s1", "headline": "...", "summary": "...", "background": "",
 "quotes": [{"article": "a1", "quote": "...", "quote_en": "..."}]}]}""",
@@ -760,6 +835,9 @@ SCHEMAS = {
     "translate": {"type": "object", "required": ["items"], "properties": {"items": {"type": "array", "items": {
         "type": "object", "required": ["id", "title", "text"],
         "properties": {"id": {"type": "integer"}, "title": {"type": "string"}, "text": {"type": "string"}}}}}},
+    "same": {"type": "object", "required": ["items"], "properties": {"items": {"type": "array", "items": {
+        "type": "object", "required": ["key", "same", "event"],
+        "properties": {"key": {"type": "string"}, "same": {"type": "string"}, "event": {"type": "string"}}}}}},
     "read": {"type": "object", "required": ["stories"], "properties": {"stories": {"type": "array", "items": {
         "type": "object", "required": ["key", "articles"],
         "properties": {"key": {"type": "string"}, "articles": {"type": "array", "items": {"type": "string"}}}}}}},
