@@ -129,7 +129,7 @@ DAILY_BUDGET = 0.60
 # With CLAUDE_CODE_OAUTH_TOKEN set, Claude writes the stories through Claude Code on the user's subscription, and
 # Mistral takes over when Claude is unavailable. The cap is in API-equivalent dollars as Claude Code reports them;
 # it only guards the subscription against a runaway loop.
-CLAUDE_WRITER = "claude-sonnet-5"
+CLAUDE_WRITER = "claude-sonnet-5-5"
 CLAUDE_EFFORT = "low"
 # Sorting the same 100 stories into interests twice changed 16 stories' interests at low effort and 7 at medium, which
 # costs about twice as much: a few cents per 100 stories. The same-news check uses it too: at low effort it combined

@@ -469,11 +469,11 @@ def test_claude_writer():
     calls = []
     news.subprocess.run = lambda cmd, **kw: calls.append(cmd) or Run(json.dumps(
         {"is_error": False, "result": "done", "structured_output": {"ok": 1}, "total_cost_usd": 0.01}))
-    assert news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {}, news.SCHEMAS["new"]) == ('{"ok": 1}', 0.01)
+    assert news.call_claude("claude-sonnet-5-5", news.NEW_PROMPT, {}, news.SCHEMAS["new"]) == ('{"ok": 1}', 0.01)
     assert json.loads(calls[0][calls[0].index("--json-schema") + 1]) == news.SCHEMAS["new"]
     assert calls[0][calls[0].index("--tools") + 1] == "", "Claude Code's own tools are off"
     assert calls[0][calls[0].index("--effort") + 1] == news.CLAUDE_EFFORT
-    news.call_claude("claude-sonnet-5", news.TAG_PROMPT, {}, {}, "medium")
+    news.call_claude("claude-sonnet-5-5", news.TAG_PROMPT, {}, {}, "medium")
     assert calls[1][calls[1].index("--effort") + 1] == "medium"
     for run, error in ((Run(json.dumps({"is_error": True, "result": "Claude AI usage limit reached"}), 1), news.ClaudeUnavailable),
                        (Run(json.dumps({"is_error": True, "result": "x", "api_error_status": 401}), 1), news.ClaudeUnavailable),
@@ -484,7 +484,7 @@ def test_claude_writer():
                        (Run(json.dumps({"is_error": True, "result": "prompt exceeds the context limit"}), 1), news.ClaudeFailed)):
         news.subprocess.run = lambda cmd, **kw: run
         try:
-            news.call_claude("claude-sonnet-5", news.NEW_PROMPT, {}, news.SCHEMAS["new"])
+            news.call_claude("claude-sonnet-5-5", news.NEW_PROMPT, {}, news.SCHEMAS["new"])
             raise AssertionError(f"expected {error.__name__}")
         except error:
             pass
